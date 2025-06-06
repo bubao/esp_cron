@@ -1,6 +1,8 @@
-# CRON like component for the ESP-IDF framework
+# CRON-like component for the ESP-IDF framework
 
-This is a cron-like clone for the esp-idf framework. It uses cron-like sytanx and time libraries included in newlib (esp-idf framework) for task scheduling.
+> 中文版请见 [README_zh.md](./README_zh.md)
+
+This is a cron-like clone for the esp-idf framework. It uses cron-like syntax and time libraries included in newlib (esp-idf framework) for task scheduling.
 
 ## How to use
 
@@ -11,7 +13,6 @@ Please remember that this module relies heavilly on the time.h library. **Time h
 ### Create
 
 Usage is pretty simple, we provided a component factory for cron-job creation. 
-
 
 ```C
 cron_job *cron_job_create(const char *schedule, cron_job_callback callback, void *data)
@@ -26,7 +27,6 @@ cron_job *cron_job_create(const char *schedule, cron_job_callback callback, void
             | │ │ │ ┌───────────── month (1 - 12)
             | │ │ │ │ ┌───────────── day of week (0 - 6) (Sunday to Saturday;
             | │ │ │ │ │                                       7 is also Sunday on some systems)
-            | │ │ │ │ │
             | │ │ │ │ │
             * * * * * *  
             
@@ -44,16 +44,11 @@ Please note that the callback is a simple function, no need for infinite loops o
 
 ### Destroy
 
-
-
 If you want to stop a previously created cron job simply call the destroy method with the returned cron_job from the creator. 
-
-
 
 ```C
 int cron_job_destroy(cron_job * job);
 ```
-
 
 ### Starting the module
 
@@ -78,7 +73,6 @@ We defined a helper to stop all cron jobs, we think it might be useful in some s
 ```C
 int cron_job_clear_all();
 ```
-
 
 ## Example
 
@@ -116,3 +110,9 @@ void test_cron_job_sample_callback(cron_job *job)
 return;
 }
 ```
+
+---
+
+Special thanks to [esp_cron](https://github.com/DavidMora/esp_cron) by David Mora Rodriguez, and the open source [ccronexpr](https://github.com/staticlibs/ccronexpr) and jobs code.
+
+> English documentation: This page is in English. 中文文档请见 [README_zh.md](./README_zh.md)
