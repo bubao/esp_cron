@@ -35,6 +35,7 @@ cron_job *cron_job_create(const char *schedule, cron_job_callback callback, void
 
 - `schedule`：cron 风格字符串，支持秒级精度。
 
+  ```
             ┌────────────── second (0 - 59)  
             | ┌───────────── minute (0 - 59)
             | │ ┌───────────── hour (0 - 23)
@@ -45,6 +46,7 @@ cron_job *cron_job_create(const char *schedule, cron_job_callback callback, void
             | │ │ │ │ │
             * * * * * *  
             
+  ```
 
 - `callback`：任务回调函数指针，定义如下：
 

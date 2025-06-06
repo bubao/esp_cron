@@ -19,7 +19,7 @@ cron_job *cron_job_create(const char *schedule, cron_job_callback callback, void
 ```
 
 * Where schedule is a cron-like string with seconds resolution. 
-
+  ```
             ┌────────────── second (0 - 59)  
             | ┌───────────── minute (0 - 59)
             | │ ┌───────────── hour (0 - 23)
@@ -30,6 +30,7 @@ cron_job *cron_job_create(const char *schedule, cron_job_callback callback, void
             | │ │ │ │ │
             * * * * * *  
             
+  ```
 Thank you alex at staticlibs.net for the good work on the parser!!. 
 
 * The callback is just a function pointer for the job that will be scheduled with the running cron_job as an argument, defined as:
