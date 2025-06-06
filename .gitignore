@@ -155,6 +155,7 @@ build/
 managed_components
 .vscode
 skdconfig.old
-example/sdkconfig.old
-example/sdkconfig
-example/dependencies.lock
+**/sdkconfig.old
+**/sdkconfig
+**/dependencies.lock
+sdkconfig.defaults

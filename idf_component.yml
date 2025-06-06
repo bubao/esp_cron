@@ -4,11 +4,16 @@ url: https://github.com/bubao/esp_cron
 issues: https://github.com/bubao/esp_cron/issues
 repository: https://github.com/bubao/esp_cron.git
 idf_minimum_required: ">=3.0"
-supported_targets:
-  - esp32
-  - esp32s2
-  - esp32s3
-  - esp32c2
-  - esp32c3
-  - esp32c6
-  - esp32h2
+tags:
+  - cron
+  - scheduler
+files:
+  use_gitignore: true
+examples:
+  - path: examples/esp_cron_example
+    name: ESP Cron Example
+    description: An example demonstrating how to use the ESP Cron component.
+    dependencies:
+      - esp_cron
+repository: "https://github.com/bubao/esp_cron.git"
+url: "https://github.com/bubao/esp_cron"
