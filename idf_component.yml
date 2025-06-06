@@ -1,0 +1,14 @@
+version: "0.0.1"
+description: ESP-IDF cron expression component
+url: https://github.com/bubao/esp_cron
+issues: https://github.com/bubao/esp_cron/issues
+repository: https://github.com/bubao/esp_cron.git
+idf_minimum_required: ">=3.0"
+supported_targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c2
+  - esp32c3
+  - esp32c6
+  - esp32h2

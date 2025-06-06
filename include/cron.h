@@ -58,6 +58,7 @@ struct cron_job_struct
   int id;
   void * load;
   time_t next_execution;
+  time_t last_triggered_sec; // 新增：防抖用，记录上次触发的秒
 };
 
 
