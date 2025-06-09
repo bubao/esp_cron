@@ -2,118 +2,236 @@
 
 > 中文版请见 [README_zh.md](./README_zh.md)
 
-This is a cron-like clone for the esp-idf framework. It uses cron-like syntax and time libraries included in newlib (esp-idf framework) for task scheduling.
+## Component Features
 
-## How to use
+This component provides CRON-style task scheduling for the ESP-IDF framework, leveraging `esp_timer.h` for high-precision timing. It's optimized for embedded scenarios, supporting CRON syntax with second-level precision and seamless integration with ESP32/ESP8266 hardware.
 
-We tried to keep module functions interface at minimum there is a creator, a destroyer a cron module starter and a cron module stopper. The workflow would be to define at least one job and then start the module. Then create and destroy jobs as desired. Keep in mind that if there are no jobs to be scheduled the cron module will stop itself, this is by design as we don't want to waste cpu time.
+## Usage Guide
 
-Please remember that this module relies heavilly on the time.h library. **Time has to be initialized before any job creation.** The library time.h can be set manually or with another component like sntp, but it must have started before to this module is in use. This component will not perform any checks to idetify if time has been set.
+The API design prioritizes simplicity, including core functions for task creation, destruction, and scheduler control. The workflow is straightforward: define at least one task, start the scheduler, then manage tasks dynamically. A smart power-saving mechanism automatically puts the scheduler into low-power mode when no tasks are scheduled, minimizing CPU overhead.
 
-### Create
+**Key Note**: Timing relies on `esp_timer` for hardware-accelerated precision, eliminating the need for system time management. Ensure proper timer initialization before creating tasks to maintain scheduling accuracy.
 
-Usage is pretty simple, we provided a component factory for cron-job creation. 
+### Code Structure
 
-```C
+```tree
+esp-cron/
+├── esp_cron.c            # Core scheduling logic & API implementation
+├── include/
+│   ├── esp_cron.h        # Public header exposing APIs
+│   └── cron_internal.h   # Internal header for scheduler internals
+├── library/
+│   ├── ccronexpr/       # CRON expression parser (open-source component)
+│   └── jobs/            # Task linked list management
+└── examples/            # Usage examples
+```
+
+## Quick Start Guide
+
+### Include Header
+
+```c
+#include "esp_cron.h"
+```
+
+### 1. Create a Scheduled Task
+
+```c
 cron_job *cron_job_create(const char *schedule, cron_job_callback callback, void *data)
 ```
 
-* Where schedule is a cron-like string with seconds resolution. 
+- `schedule` supports CRON expressions with second-level precision:
+  ```txt
+    ┌────────────── second (0 - 59)
+    | ┌───────────── minute (0 - 59)
+    | │ ┌───────────── hour (0 - 23)
+    | │ │ ┌───────────── day of month (1 - 31)
+    | │ │ │ ┌───────────── month (1 - 12)
+    | │ │ │ │ ┌───────────── day of week (0 - 6, Sunday=0; 7=Sunday in some systems)
+    | │ │ │ │ │
+    * * * * * *
   ```
-            ┌────────────── second (0 - 59)  
-            | ┌───────────── minute (0 - 59)
-            | │ ┌───────────── hour (0 - 23)
-            | │ │ ┌───────────── day of month (1 - 31)
-            | │ │ │ ┌───────────── month (1 - 12)
-            | │ │ │ │ ┌───────────── day of week (0 - 6) (Sunday to Saturday;
-            | │ │ │ │ │                                       7 is also Sunday on some systems)
-            | │ │ │ │ │
-            * * * * * *  
-            
+- `callback` is a task handler function pointer, defined as:
+  ```c
+  typedef void (*cron_job_callback)(cron_job *);
   ```
-Thank you alex at staticlibs.net for the good work on the parser!!. 
+  Callbacks are designed to be lightweight; the scheduler manages execution cycles automatically.
+- `data` is a user-defined pointer passed to the callback with the task handle.
 
-* The callback is just a function pointer for the job that will be scheduled with the running cron_job as an argument, defined as:
+### Destroy a Task
 
-```C
-typedef void (*cron_job_callback)(cron_job *);
+Stop an existing task with:
+
+```c
+int cron_job_destroy(cron_job *job);
 ```
 
-Please note that the callback is a simple function, no need for infinite loops or vTask calls, the cron module will handle this for you
+### Start the Scheduler
 
-* And data is a non managed, non typed  pointer that will be stored in the cron_job structure that can be used as the user needs.
+Launch the scheduler after defining at least one task:
 
-### Destroy
-
-If you want to stop a previously created cron job simply call the destroy method with the returned cron_job from the creator. 
-
-```C
-int cron_job_destroy(cron_job * job);
-```
-
-### Starting the module
-
-You can start the module with at least one defined job by calling 
-
-```C
+```c
 int cron_start();
 ```
 
-### Stopping the module
+### Stop the Scheduler
 
-You can stop the module by calling 
+Shut down the scheduler:
 
-```C
+```c
 int cron_stop();
 ```
 
-### Clearing all jobs a.k.a destroying all jobs
+### Clear All Tasks
 
-We defined a helper to stop all cron jobs, we think it might be useful in some situations
+Remove all scheduled tasks:
 
-```C
+```c
 int cron_job_clear_all();
 ```
 
-## Example
+### Example Usage
 
-The first thing you need to pay attention to is to initialize the time module of newlib, you can do this in several ways, one good example is to use sntp for this. But if you want to do it manually the following code will work. 
+```c
+/* Initialize ESP-Timer (project-dependent, not component-required) */
+esp_timer_init();
 
-```C
-  /* YOU MUST SET THE TIME FIRST BE CAREFUL ABOUT THIS - NOT PART OF THE MODULE*/
-  struct timeval tv;
-  time_t begin=1530000000;
-  tv.tv_sec = begin; // SOMEWHERE IN JUNE 2018
-  settimeofday(&tv, NULL);
-  /* END TIME SET */
+/* Create two scheduled tasks */
+cron_job *jobs[2];
+jobs[0] = cron_job_create("* * * * * *", on_timer_trigger, (void *)0);
+jobs[1] = cron_job_create("*/5 * * * * *", on_timer_trigger, (void *)10000);
+
+/* Start scheduler */
+cron_start();
+
+/* Simulate main program execution (replace with business logic) */
+vTaskDelay(pdMS_TO_TICKS(60000));  // Run for 60 seconds
+
+/* Cleanup resources */
+cron_stop();
+cron_job_clear_all();
 ```
 
-The header for this is just `cron.h`.
+Callback function example:
 
-The code below is all you need to run the code notice that we are running a sample callback function which you can find after this code. 
-
-```C
-  cron_job * jobs[2];
-  jobs[0]=cron_job_create("* * * * * *",test_cron_job_sample_callback,(void *)0);
-  jobs[1]=cron_job_create("*/5 * * * * *",test_cron_job_sample_callback,(void *)10000);
-  cron_start();
-  vTaskDelay((running_seconds * 1000) / portTICK_PERIOD_MS); // This is just to emulate a delay between the calls
-  cron_stop();
-  cron_job_clear_all();
-```
-
-Sample callback:
-
-```C
-void test_cron_job_sample_callback(cron_job *job)
+```c
+void on_timer_trigger(cron_job *job)
 {
-  /* DO YOUR WORK IN HERE */
-return;
+  uint32_t task_id = (uint32_t)job->data;
+  printf("Task %u triggered at %lu ms\n", task_id, esp_timer_get_time() / 1000);
 }
 ```
 
----
+## Core API Reference
 
-Special thanks to [esp_cron](https://github.com/DavidMora/esp_cron) by David Mora Rodriguez, and the open source [ccronexpr](https://github.com/staticlibs/ccronexpr) and jobs code.
+### Task Management
+
+| Function                  | Description                          |
+|---------------------------|--------------------------------------|
+| `cron_job* cron_job_create(const char* schedule, cron_job_callback callback, void* data);` | Create and register a task           |
+| `int cron_job_destroy(cron_job* job);` | Destroy a specific task              |
+| `int cron_job_clear_all();` | Clear all scheduled tasks            |
+
+### Scheduler Control
+
+| Function          | Description                        |
+|-------------------|------------------------------------|
+| `int cron_start();` | Start the task scheduler           |
+| `int cron_stop();` | Stop the task scheduler            |
+
+### Task Scheduling Operations
+
+| Function                | Description                          |
+|-------------------------|--------------------------------------|
+| `int cron_job_schedule(cron_job* job);` | Manually schedule a task             |
+| `int cron_job_unschedule(cron_job* job);` | Unscheduled a task                   |
+| `void cron_schedule_task(void* args);` | Special scheduling (e.g., run once)  |
+
+### Status Queries
+
+| Function                          | Description                          |
+|-----------------------------------|--------------------------------------|
+| `int cron_job_load_expression(cron_job* job, const char* schedule);` | Dynamically load a CRON expression   |
+| `int cron_job_has_loaded(cron_job* job);` | Check if an expression is loaded     |
+| `time_t cron_job_seconds_until_next_execution();` | Get seconds until next execution     |
+
+## Time Synchronization & Precision Optimization
+
+### Local Timezone Configuration
+
+For projects requiring timezone-aware time display:
+
+1. **Timezone environment configuration**:
+   ```c
+   setenv("TZ", "CST-8", 1);  // Beijing Time (UTC+8)
+   tzset();  // Apply timezone settings
+   ```
+   This affects functions like `localtime` but **does not impact scheduling precision**—tasks run based on hardware timer absolute time, independent of system timezone.
+2. **SNTP time synchronization (optional)**:
+   For standard time in logs or displays:
+   ```c
+   void init_system_time(void) {
+       sntp_setoperatingmode(SNTP_OPMODE_POLL);
+       sntp_setservername(0, "pool.ntp.org");  // Use domestic servers like "cn.ntp.org"
+       sntp_init();
+
+       int retry = 0;
+       const int max_retry = 10;
+       while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && retry < max_retry) {
+           vTaskDelay(pdMS_TO_TICKS(1000));
+           retry++;
+       }
+       time_t now = 0;
+       time(&now);
+       printf("System time synced: %s", ctime(&now));
+   }
+   ```
+   **Note**: SNTP syncs only the system time for display; scheduling relies on `esp_timer` hardware timing, unaffected by network latency.
+
+### Precision Optimization Guide
+
+1. **Hardware timer configuration**:
+   ```c
+   /* Enable high-precision timer mode (ESP32-specific) */
+   esp_timer_create_args_t timer_args = {
+       .callback = NULL,
+       .arg = NULL,
+       .flags = ESP_TIMER_FLAG_HIGH_PRECISION,  // Key: enable APB clock source
+   };
+   esp_timer_init(&timer_args);
+   ```
+2. **Scheduler parameter tuning**:
+   ```c
+   /* Configure minimum scheduling interval (default: 1ms, adjust for power consumption) */
+   #define MIN_SCHEDULE_INTERVAL_US 100000  // 100ms interval for light sleep
+
+   cron_start();  // Apply configuration on startup
+   ```
+3. **Low-power scenario adaptation**:
+   ```c
+   /* Combine with timer wakeup for low-power scheduling */
+   esp_sleep_enable_timer_wakeup(5000000);  // Wake up every 5 seconds
+   esp_light_sleep_start();
+   ```
+   The scheduler checks task triggers during wakeup cycles, balancing precision and power consumption.
+
+### Why No Timezone Dependence for Scheduling?
+
+This component uses **direct hardware timer timing** with these advantages:
+
+1. **Precision isolation**: Triggers rely on ESP32 internal timers, unaffected by system time or timezone, with microsecond-level accuracy.
+2. **No network dependency**: Stable scheduling without SNTP, ideal for offline embedded scenarios.
+3. **Power optimization**: Timers work independently during CPU sleep, avoiding constant wakeups in traditional time systems.
+
+**Actual role of timezone configuration**: Only affects time display formats via functions like `localtime`, fully decoupled from scheduling logic.
+
+## Acknowledgments
+
+- [esp_cron](https://github.com/DavidMora/esp_cron) by David Mora Rodriguez
+- [ccronexpr](https://github.com/staticlibs/ccronexpr) expression parser
+
+## License
+
+This project is licensed under the [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0).
 
 > English documentation: This page is in English. 中文文档请见 [README_zh.md](./README_zh.md)
