@@ -16,7 +16,7 @@
 //
 // Author: David Mora Rodriguez dmorar (at) insite.com.co
 //
-#include "cron.h"
+#include "esp_cron.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
