@@ -15,6 +15,6 @@
 # set(COMPONENT_ADD_INCLUDEDIRS "library/ccronexpr" "library/jobs" ".")
 # set(COMPONENT_SRCDIRS "library/ccronexpr" "library/jobs" ".")
 
-idf_component_register(SRCS "cron.c" "library/ccronexpr/ccronexpr.c" "library/jobs/jobs.c"
+idf_component_register(SRCS "esp_cron.c" "library/ccronexpr/ccronexpr.c" "library/jobs/jobs.c"
                        INCLUDE_DIRS "library/ccronexpr" "library/jobs" "include" "."
                        REQUIRES esp_timer)
