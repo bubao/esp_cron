@@ -1,4 +1,4 @@
-version: "0.0.2"
+version: "0.0.3"
 description: ESP-IDF cron expression component
 url: https://github.com/bubao/esp_cron
 issues: https://github.com/bubao/esp_cron/issues
