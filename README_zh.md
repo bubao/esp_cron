@@ -19,7 +19,7 @@ esp-cron/
 ├── esp_cron.c            # 核心调度逻辑与 API 实现
 ├── include/
 │   ├── esp_cron.h        # 公共头文件，暴露 API
-│   └── cron_internal.h   # 内部头文件，调度器实现
+│   └── cron.h            # 内部头文件，调度器实现
 ├── library/
 │   ├── ccronexpr/       # cron 表达式解析器（开源组件）
 │   └── jobs/            # 任务链表管理模块
