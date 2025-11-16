@@ -27,6 +27,10 @@
 #include <string.h>
 #include <time.h>
 
+#define CONFIG_ESP_CRON_ENABLED 1
+#define CONFIG_ESP_CRON_USE_STDLIB 1
+
+
 #define MIN_DELAY_US 1000 // 1ms，或根据需求调整
 
 typedef struct {

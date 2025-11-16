@@ -1,9 +1,0 @@
-menu "esp_cron configuration"
-
-config ESP_CRON_ENABLE
-    bool "Enable esp_cron component"
-    default y
-    help
-        Enable or disable the esp_cron component.
-
-endmenu

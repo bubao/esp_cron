@@ -19,6 +19,17 @@
 
 #ifndef _ESP_CRON_JOBS_LINKED_LIST
 #define _ESP_CRON_JOBS_LINKED_LIST
+
+ #ifdef __cplusplus
+extern "C" {
+#endif
+
+// original content here
+
+#ifdef __cplusplus
+}
+#endif
+
 #include <time.h>
 #include "cron.h"
 
