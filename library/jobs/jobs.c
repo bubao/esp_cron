@@ -18,6 +18,7 @@
 //
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <stdlib.h>
 #include "jobs.h"
 
 // STATIC FUNCTION DECLARATIONS
@@ -73,7 +74,7 @@ int cron_job_list_insert(cron_job *job)
   {
     return -1;
   }
-  struct cron_job_node *new_node = calloc(sizeof(struct cron_job_node),1);
+  struct cron_job_node *new_node = calloc(1, sizeof(struct cron_job_node));
   if (new_node == NULL)
   {
     return -1;
