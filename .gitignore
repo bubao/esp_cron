@@ -159,3 +159,4 @@ skdconfig.old
 **/sdkconfig
 **/dependencies.lock
 sdkconfig.defaults
+dist
