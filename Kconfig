@@ -21,10 +21,13 @@ config ESP_CRON_QUEUE_DEPTH
         Maximum number of due jobs that can be queued at once.
 
 config ESP_CRON_MAX_DUE_JOBS
-    int "Maximum due jobs handled per timer callback"
+    int "Maximum due jobs processed per timer callback"
     default 16
     help
         Maximum number of jobs processed in a single timer callback.
+        Due jobs beyond this limit stay in the schedule and are processed
+        by the next timer fire; they are never dropped.
+        This bounds the per-callback work, not the concurrent runner count.
 
 config ESP_CRON_MIN_DELAY_US
     int "Minimum timer delay (microseconds)"

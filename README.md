@@ -418,7 +418,7 @@ Once a job is **successfully queued** (its runner may not have started yet), its
 
 Note: `cron_stop()` does **not** wait for callbacks already in-flight. Queued/running jobs finish on their runners (refcount guarantees safe teardown); un-consumed queue references are drained and released without leaking.
 
-> `MAX_DUE_JOBS` is the **number processed per timer callback**, `QUEUE_DEPTH` is the **pending-execution queue capacity** — neither is a limit on how many cron jobs you may create. So `16` does not mean "max 16 jobs". If more jobs are due in one moment than `QUEUE_DEPTH`, the excess is dropped (`queue full` warning) but the offending jobs are rescheduled for their next matching moment.
+> `MAX_DUE_JOBS` is the **number processed per timer callback**, `QUEUE_DEPTH` is the **pending-execution queue capacity** — neither is a limit on how many cron jobs you may create. So `16` does not mean "max 16 jobs". If more jobs are due in one moment than `MAX_DUE_JOBS`, the excess **stays in the schedule** and is processed by the next timer fire (`MIN_DELAY` clamp) — jobs are never dropped, only slightly batched. If more jobs are due than `QUEUE_DEPTH`, the excess is dropped from that cycle (`queue full` warning) but the offending jobs are rescheduled for their next matching moment.
 
 ### Queue full behavior
 

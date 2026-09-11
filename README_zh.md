@@ -418,7 +418,7 @@ job 一旦**成功入队**（runner 可能尚未启动），`in_flight` 即置�
 
 与 callback 的关系：`cron_stop()` **不等待正在执行的 callback**。已入队/service 的 job 会继续在 runner 上执行完，由引用计数安全收尾；未消费的队列引用被协议化排空，不泄漏。
 
-> `MAX_DUE_JOBS` 是**单次 timer 回调处理数量**，`QUEUE_DEPTH` 是**待执行队列容量** —— 两者都不是系统支持的最大 cron job 数量。所以 `16` 不代表"最多 16 个任务"。若同一时刻到期任务超过 `QUEUE_DEPTH`，超出的会被丢弃（打印 queue full 警告），但对应 job 会重新排到下一个匹配时刻。
+> `MAX_DUE_JOBS` 是**单次 timer 回调处理数量**，`QUEUE_DEPTH` 是**待执行队列容量** —— 两者都不是系统支持的最大 cron job 数量。所以 `16` 不代表"最多 16 个任务"。若同一时刻到期任务超过 `MAX_DUE_JOBS`，超出部分**留在调度表中**，由下一次 timer 回调（delay 夹紧到 MIN_DELAY）继续处理——job 不丢失，只是分批。若同一时刻到期任务超过 `QUEUE_DEPTH`，超出的会被丢弃（打印 queue full 警告），但对应 job 会重新排到下一个匹配时刻。
 
 ### 队列满时的行为
 

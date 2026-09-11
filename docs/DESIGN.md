@@ -12,7 +12,8 @@
 │                                 │                │
 │               s_mutex           ▼                │
 │              ┌──────────────────────┐            │
-│              │  筛选到期 job（≤16）  │            │
+│              │  筛选到期 job         │            │
+│              │  （≤MAX_DUE_JOBS）   │            │
 │              │  ref → 入队 → 移除   │            │
 │              └──────────┬───────────┘            │
 │                         │ xQueueSend             │
@@ -161,6 +162,28 @@ queue 满 → 打印警告 → 恢复 in_flight → unref（不泄漏） → sta
 
 必须恢复 `in_flight`：否则该 job 再到期时会被当成"仍在执行"永远跳过（dead）。恢复后 job 下次匹配时刻仍会正常触发。
 
+### 到期数超过 MAX_DUE_JOBS（P0-1）
+
+```
+timer_cb 只取链表中到期的前 MAX_DUE_JOBS 个：
+  数组满 → 停止扫描 → 其余到期 job 保留在链表中
+  下一次 timer_cb（delay 被夹紧到 MIN_DELAY≈1ms）继续处理
+  每个被取出的 job 必然进 due_jobs[] → 本轮结尾统一重排
+```
+
+绝不发生"从链表移除却未重排"（那是丢 job）。`MAX_DUE_JOBS` 只约束单次回调的工作量，不约束 job 总数，也不删 job。
+
+### runner 创建失败（P1-2）
+
+```
+worker 取出 job → xTaskCreate 失败（或注入 hook 强制失败）：
+    ├── 恢复 in_flight = false（否则该 job 被永久跳过）
+    ├── unref（释放队列持有的引用）
+    └── job 已在 timer_cb 中被重排回链表 → 下次到期继续触发，不丢失
+```
+
+测试钩子：`cron_job_test_force_runner_create_fail()`（weak 返回 0，测试二进制强覆盖）注入失败路径。
+
 ### cron_stop 协作式停机（P0-2）
 
 ```
@@ -171,7 +194,7 @@ cron_stop()
   ├── 等待 worker ack（s_worker_done，最多 1s；超时才防御性 vTaskDelete）
   ├── 排空队列（unref 残留引用）
   ├── state = STOPPED
-  └── cron_job_clear_all()
+  └── cron_job_clear_all_locked()（持 s_mutex，与 state 原子）
 ```
 
 - 不直接在停机窗口 `vTaskDelete(cron.handle)`——避免 worker 半途退出破坏 refcount 追责链
@@ -246,6 +269,27 @@ tzset();
 
 5 个 job 的典型场景：~380 bytes RAM + worker 常驻栈 + runner 瞬时栈。
 
+### ESP32-S2 内存风险评估（P1-7）
+
+**每触发一个 job 就创建一个 runner task**（4KB 栈 + TCB ≈ 4.1KB）。并发 runner 数受两个因素限制：
+
+- **入队上限**：同一时刻最多 `CONFIG_ESP_CRON_QUEUE_DEPTH`（默认 10）个 job 在途
+- **in_flight 防重入**：每个 job 同一时刻只有一个 runner
+
+因此并发 runner 峰值 ≤ `QUEUE_DEPTH`：
+
+| 配置 | 并发 runner 峰值 | 瞬时内存（栈 + TCB） |
+|------|------------------|----------------------|
+| 默认（QUEUE_DEPTH=10, 栈 4096） | 10 | ~41 KB |
+| 典型自定义（QUEUE_DEPTH=5） | 5 | ~20.5 KB |
+| 最极端（10 个 job 同时触发长回调） | 10 | ~41 KB |
+
+加上 worker 常驻 4KB 栈，调度器最坏瞬时占用 ≈ 45 KB（占 320KB SRAM 的 ~14%），**短暂尖峰**，回调结束即释放。
+
+**潜在风险**：短周期 + 长回调组合会持续造成 task create/delete churn（每触一次 ~0.1ms 级开销），且每次触发都短暂占用栈。若 callback 栈需求与 4096 设定不符，需调大 `WORKER_STACK_SIZE`（runner 复用同一配置）。对高吞吐场景建议回调内只发事件，不用 esp_cron 直接跑重任务。
+
+**前提**：runner 并发顶点受 `QUEUE_DEPTH` 限制，这一性质依赖 P1-2 失败恢复正确（否则 in_flight 卡死会引发任务无界增长）。回归测试 `runner create failure restores job` 覆盖此前提。
+
 ---
 
 ## 关键配置项
@@ -259,8 +303,9 @@ CONFIG_ESP_CRON_QUEUE_DEPTH = 10
     下次 timer_cb 自动重排。一般场景够用。
 
 CONFIG_ESP_CRON_MAX_DUE_JOBS = 16
-    单次 timer_cb 处理上限。超过的 job 留到下一次 timer_cb（1秒内）处理。
-    不是"最多支持 16 个 job"——job 数量没有上限（RAM 限制除外）。
+    单次 timer_cb 处理上限。到期数超过此值时不丢 job（P0-1）：
+    剩余到期 job 留在链表中，下一次 timer_cb（delay 夹紧到 MIN_DELAY）
+    继续处理。只约束单次回调工作量，不约束 job 总数与并发 runner 数。
 
 CONFIG_ESP_CRON_MIN_DELAY_US = 1000
     timer 最小延迟。防止 next_execution ≤ now 时以 0 延迟反复触发。

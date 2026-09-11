@@ -23,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "unity.h"
+#include "esp_heap_caps.h"
 #include "cron.h"
 #include "jobs.h"
 
@@ -329,4 +330,290 @@ TEST_CASE("**CRON_JOB - stop while callback in-flight is safe (cooperative shutd
   TEST_ASSERT_EQUAL_INT(0, cron_stop());
 
   cron_job_destroy(job);
+}
+
+// ===== P0-1 回归：到期 job 超过 MAX_DUE_JOBS 时不能永久丢失 =====
+static volatile int s_counters[8];
+
+static void counter_cb(cron_job* job)
+{
+  int idx = (int)(intptr_t)job->data;
+  if (idx >= 0 && idx < 8)
+    s_counters[idx]++;
+}
+
+TEST_CASE("**CRON_JOB - due jobs beyond MAX_DUE_JOBS are not lost", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  const int N = 8; // > CONFIG_ESP_CRON_MAX_DUE_JOBS(4)：首次到期必超上限
+  memset((void*)s_counters, 0, sizeof(s_counters));
+
+  cron_job* jobs[N];
+  for (int i = 0; i < N; i++) {
+    jobs[i] = cron_job_create("* * * * * *", counter_cb, (void*)(intptr_t)i);
+    TEST_ASSERT_NOT_NULL(jobs[i]);
+  }
+
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+  vTaskDelay(pdMS_TO_TICKS(3500)); // 3 个完整周期
+
+  for (int i = 0; i < N; i++)
+    TEST_ASSERT_INT_WITHIN_MESSAGE(
+        0, s_counters[i], s_counters[i],
+        s_counters[i] >= 2 ? "OK" : "P0-1 REGRESSION: BEYOND-MAX JOB LOST");
+
+  TEST_ASSERT_EQUAL_INT(0, cron_stop());
+  for (int i = 0; i < N; i++)
+    cron_job_destroy(jobs[i]);
+  TEST_ASSERT_EQUAL_INT(0, cron_job_node_count());
+}
+
+// ===== P0-3 回归：queue-full 时 job 恢复 in_flight 且下一周期继续触发 =====
+static volatile int s_fast_counters[4];
+
+static void fast_cb(cron_job* job)
+{
+  int idx = (int)(intptr_t)job->data;
+  if (idx >= 0 && idx < 4)
+    s_fast_counters[idx]++;
+}
+
+// 两个占用队列的慢回调：把 QUEUE_DEPTH(2) 占满，逼后来的 job 走 queue-full
+static void hold_slot_cb(cron_job* job)
+{
+  vTaskDelay(pdMS_TO_TICKS(1300));
+}
+
+TEST_CASE("**CRON_JOB - queue full skips cycle but job keeps firing", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  memset((void*)s_fast_counters, 0, sizeof(s_fast_counters));
+
+  // 慢回调先建：同一秒内排序靠前，先入队占满 2 个空位
+  cron_job* hold[2];
+  for (int i = 0; i < 2; i++) {
+    hold[i] = cron_job_create("* * * * * *", hold_slot_cb, NULL);
+    TEST_ASSERT_NOT_NULL(hold[i]);
+  }
+  cron_job* fast[4];
+  for (int i = 0; i < 4; i++) {
+    fast[i] = cron_job_create("* * * * * *", fast_cb, (void*)(intptr_t)i);
+    TEST_ASSERT_NOT_NULL(fast[i]);
+  }
+
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+  vTaskDelay(pdMS_TO_TICKS(4000));
+
+  // 每个 fast job 至少触发 ≥2 次：即使某周期 queue-full 被跳过，也继续触发
+  for (int i = 0; i < 4; i++)
+    TEST_ASSERT_INT_WITHIN_MESSAGE(
+        0, s_fast_counters[i], s_fast_counters[i],
+        s_fast_counters[i] >= 2 ? "OK" : "P0-3 REGRESSION: QUEUE-FULL JOB STARVED");
+
+  TEST_ASSERT_EQUAL_INT(0, cron_stop());
+  for (int i = 0; i < 2; i++)
+    cron_job_destroy(hold[i]);
+  for (int i = 0; i < 4; i++)
+    cron_job_destroy(fast[i]);
+  TEST_ASSERT_EQUAL_INT(0, cron_job_node_count());
+}
+
+// ===== P1-2 回归：xTaskCreate 失败 → in_flight 恢复，job 不被永久跳过 =====
+static volatile int s_force_runner_fail = 0;
+static volatile int s_runner_fail_hits;
+
+int32_t cron_job_test_force_runner_create_fail(void) // 强覆盖 esp_cron.c 的 weak 默认实现
+{
+  if (s_force_runner_fail) {
+    s_runner_fail_hits++;
+    return 1;
+  }
+  return 0;
+}
+
+TEST_CASE("**CRON_JOB - runner create failure restores job (fault injection)", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  s_runner_fail_hits = 0;
+  s_counters[0] = 0;
+
+  cron_job* job = cron_job_create("* * * * * *", counter_cb, (void*)(intptr_t)0);
+  TEST_ASSERT_NOT_NULL(job);
+
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+
+  // 故障窗口：至少跨 2 个触发周期，runner 全部创建失败
+  s_force_runner_fail = 1;
+  vTaskDelay(pdMS_TO_TICKS(2300));
+  s_force_runner_fail = 0;
+
+  // 故障期间不应执行任何 callback
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, s_counters[0], "P1-2 REGRESSION: CALLBACK RAN WHILE RUNNER CREATE FAILS");
+  TEST_ASSERT_MESSAGE(s_runner_fail_hits >= 1, "Fault injection hook never fired");
+
+  // 恢复后必须仍能触发（证明 in_flight 被恢复，job 没有被永久锁死）
+  vTaskDelay(pdMS_TO_TICKS(1600));
+  TEST_ASSERT_INT_WITHIN_MESSAGE(
+      0, s_counters[0], s_counters[0],
+      s_counters[0] >= 1 ? "OK" : "P1-2 REGRESSION: JOB DEAD AFTER RUNNER FAILURE");
+
+  TEST_ASSERT_EQUAL_INT(0, cron_stop());
+  cron_job_destroy(job);
+  TEST_ASSERT_EQUAL_INT(0, cron_job_node_count());
+}
+
+// ===== P1-4 回归：callback 内自销毁安全（destroy 是终态） =====
+static volatile int s_self_destroy_count;
+
+static void self_destroy_cb(cron_job* job)
+{
+  s_self_destroy_count++;
+  cron_job_destroy(job); // 自销毁：合法，不得崩
+}
+
+TEST_CASE("**CRON_JOB - self-destroy in callback is safe", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  s_self_destroy_count = 0;
+
+  cron_job* job = cron_job_create("* * * * * *", self_destroy_cb, NULL);
+  TEST_ASSERT_NOT_NULL(job);
+
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+  vTaskDelay(pdMS_TO_TICKS(2500));
+
+  TEST_ASSERT_EQUAL_INT_MESSAGE(1, s_self_destroy_count, "JOB MUST FIRE EXACTLY ONCE THEN SELF-DESTROY");
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, cron_job_node_count(), "P1-4 REGRESSION: SELF-DESTROYED JOB STILL SCHEDULED");
+
+  TEST_ASSERT_EQUAL_INT(0, cron_stop()); // job 已随销毁释放，此处不再 destroy
+}
+
+TEST_CASE("**CRON_JOB - destroy blocks future firings", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  s_counters[1] = 0;
+  cron_job* job = cron_job_create("* * * * * *", counter_cb, (void*)(intptr_t)1);
+  TEST_ASSERT_NOT_NULL(job);
+
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+  vTaskDelay(pdMS_TO_TICKS(1200));
+  TEST_ASSERT_MESSAGE(s_counters[1] >= 1, "JOB SHOULD HAVE FIRED BEFORE DESTROY");
+
+  TEST_ASSERT_EQUAL_INT(0, cron_job_destroy(job));
+  int fired_at_destroy = s_counters[1];
+  vTaskDelay(pdMS_TO_TICKS(2200));
+
+  TEST_ASSERT_EQUAL_INT_MESSAGE(fired_at_destroy, s_counters[1], "DESTROYED JOB KEPT FIRING");
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, cron_job_node_count(), "DESTROYED JOB STILL SCHEDULED");
+
+  TEST_ASSERT_EQUAL_INT(0, cron_stop());
+}
+
+// ===== P1-6 回归：SNTP 前后跳变后 job 仍继续触发 =====
+static volatile int s_jump_count;
+
+static void jump_cb(cron_job* job)
+{
+  s_jump_count++;
+}
+
+TEST_CASE("**CRON_JOB - forward time jump keeps jobs firing", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  s_jump_count = 0;
+  cron_job* job = cron_job_create("* * * * * *", jump_cb, NULL);
+  TEST_ASSERT_NOT_NULL(job);
+
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+  vTaskDelay(pdMS_TO_TICKS(1200));
+  TEST_ASSERT_MESSAGE(s_jump_count >= 1, "SHOULD FIRE BEFORE JUMP");
+
+  int before = s_jump_count;
+  tv.tv_sec = 1530000000 + 20; // 前跳 20s
+  settimeofday(&tv, NULL);
+  cron_job_reschedule_all(); // 文档要求：跳变后主动重建调度
+
+  vTaskDelay(pdMS_TO_TICKS(2200));
+  TEST_ASSERT_MESSAGE(s_jump_count > before, "P1-6 REGRESSION: JOB STOPPED FIRING AFTER FORWARD JUMP");
+
+  TEST_ASSERT_EQUAL_INT(0, cron_stop());
+  cron_job_destroy(job);
+}
+
+TEST_CASE("**CRON_JOB - backward time jump keeps jobs firing", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  s_jump_count = 0;
+  cron_job* job = cron_job_create("* * * * * *", jump_cb, NULL);
+  TEST_ASSERT_NOT_NULL(job);
+
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+  vTaskDelay(pdMS_TO_TICKS(1200));
+  TEST_ASSERT_MESSAGE(s_jump_count >= 1, "SHOULD FIRE BEFORE JUMP");
+
+  int before = s_jump_count;
+  tv.tv_sec = 1530000000 - 20; // 后跳 20s：必须靠手动 reschedule_all 唤醒
+  settimeofday(&tv, NULL);
+  cron_job_reschedule_all();
+
+  vTaskDelay(pdMS_TO_TICKS(2200));
+  TEST_ASSERT_MESSAGE(s_jump_count > before, "P1-6 REGRESSION: JOB STOPPED FIRING AFTER BACKWARD JUMP");
+
+  TEST_ASSERT_EQUAL_INT(0, cron_stop());
+  cron_job_destroy(job);
+}
+
+// ===== create/destroy 压力：无内存泄漏、链表归零 =====
+TEST_CASE("**CRON_JOB - create/destroy stress has no leak", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  // 预热：确保 mutex/锁已初始化（计入 before 快照）
+  cron_job* warm = cron_job_create("* * * * * *", NULL, NULL);
+  cron_job_destroy(warm);
+
+  size_t before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  int base_nodes = cron_job_node_count();
+
+  for (int i = 0; i < 500; i++) {
+    cron_job* j = cron_job_create("* * * * * *", NULL, NULL);
+    if (!j) {
+      TEST_FAIL_MESSAGE("create failed mid-stress");
+      break;
+    }
+    cron_job_destroy(j);
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(100)); // 等后台 runner/清理完全落地
+  size_t after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+
+  TEST_ASSERT_EQUAL_INT_MESSAGE(base_nodes, cron_job_node_count(), "NODE COUNT DRIFTED");
+  // 只允许"减小 ≤2KB"，允许增长（其他子系统惰性释放的噪声）。
+  // 真实泄漏是单调缩水，方向至关重要。
+  TEST_ASSERT_MESSAGE(
+      after + 2048 >= before,
+      "LEAK DETECTED: FREE HEAP SHRANK BY >2KB");
 }

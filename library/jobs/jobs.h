@@ -53,6 +53,15 @@ int cron_job_list_insert(cron_job * job);
 int32_t cron_job_test_force_insert_fail(void);
 
 /*
+*  SUMMARY: Fault-injection hook for tests (weak, default returns 0).
+*  Override in a test binary to force cron_worker_task runner creation
+*  to fail (P1-2 xTaskCreate failure path).
+*
+*  RETURNS: non-zero forces the worker to treat runner creation as failed
+*/
+int32_t cron_job_test_force_runner_create_fail(void);
+
+/*
 *  SUMMARY: Removes a node from the list by job id.
 *
 *  RETURNS: 0 on success, -1 on not found

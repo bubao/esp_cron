@@ -85,7 +85,13 @@ cron_job * cron_job_create(const char * schedule,cron_job_callback callback, voi
 *  
 *  PARAMS: Cron job to deallocate
 *
-*  RETURNS: heap allocated cron_job
+*  RETURNS: 0 on success, -1 on NULL job
+*
+*  NOTE: Terminal. After destroy the job is cancelled, removed from the
+*  schedule and future firings stop. The job memory is released when the last
+*  reference goes away (the caller's create-ref plus any queued execution).
+*  Destroying a job from inside its own callback is supported. Destroy is not
+*  idempotent: destroying the same job twice is a double-free.
 */
 
 int cron_job_destroy(cron_job * job);
@@ -114,15 +120,25 @@ int cron_job_reschedule_all();
 /*
 *  SUMMARY: Starts the schedule module (creates a new task on the operating system)
 *
-*  RETURNS:  0 on success
+*  RETURNS:  0 on success, -1 on allocation failure
+*  NOTE: Idempotent (0 when already running). Returns -1 while a stop is in progress.
 */
 
 int cron_start();
 
 /*
-*  SUMMARY: Stops the schedule module (deletes the cron task on the operating system)
+*  SUMMARY: Stops the schedule module (stops the timer, exits the worker task,
+*  drains the queue) and clears the whole schedule.
 *
-*  RETURNS:  0 on success
+*  RETURNS:  0 on success, -1 if not running
+*
+*  NOTE: Safe to call while a callback is in-flight (cooperative shutdown:
+*  does not wait for or force-kill running callbacks, they finish on their own
+*  refcount). After this returns the scheduler is STOPPED and every job has
+*  been removed from the schedule and marked cancelled. Job memory is NOT
+*  freed here: it belongs to the caller, which must still call
+*  cron_job_destroy() on any jobs it holds. A new cron_start() afterwards is
+*  a clean slate.
 */
 
 int cron_stop();
