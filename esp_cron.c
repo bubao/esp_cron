@@ -313,6 +313,11 @@ static void schedule_next_timer_locked()
     if (delay_us < CONFIG_ESP_CRON_MIN_DELAY_US)
         delay_us = CONFIG_ESP_CRON_MIN_DELAY_US;
 
+    // esp_timer 未创建（cron_start 之前 schedule/unschedule）时跳过：
+    // job 仍在调度链表中，cron_start 会重新 arm 最早任务，不会丢失。
+    if (!cron.esp_timer)
+        return;
+
     esp_timer_stop(cron.esp_timer);
     esp_timer_start_once(cron.esp_timer, delay_us);
 
