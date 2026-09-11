@@ -28,58 +28,41 @@ struct cron_job_node {
 };
 
 /*
-*  SUMMARY: Returns the first element in the linkedlist. 
+*  SUMMARY: Returns the first element in the linked list.
 *
-*  PARAMS: Time input (timestamp) 
-*
-*  RETURNS:  hour 
+*  RETURNS:  first node or NULL
 */
-
 struct cron_job_node * cron_job_list_first();
+
 /*
-*  SUMMARY: Adds a job to the list in execution order. 
+*  SUMMARY: Adds a job to the list in execution order.
+*  The job id must already be assigned by the caller.
 *
 *  PARAMS: job
 *
-*  RETURNS:  id or -1 on error 
+*  RETURNS: job id or -1 on error
 */
 int cron_job_list_insert(cron_job * job);
+
 /*
-*  SUMMARY: Removes a node from the list. 
-*  Note that for a new node the id must be -1 and this method will give you a new id.
-*  Ids start at zero and grow from there, so job->id must be set to -1.
-*
-*  PARAMS: id for the node
+*  SUMMARY: Removes a node from the list by job id.
 *
 *  RETURNS: 0 on success, -1 on not found
 */
 int cron_job_list_remove(int id);
 
-
 /*
-*  SUMMARY:Counts elements on list o(N). 
-*
-*  PARAMS: NONE
+*  SUMMARY: Counts elements on list. O(n)
 *
 *  RETURNS: number of nodes on list
 */
 int cron_job_node_count();
+
 /*
-*  SUMMARY: initializes the needed structures for the module to work (like mutex). It is safe to call it multiple times.
+*  SUMMARY: Initializes the module structures (like mutex). Safe to call multiple times.
 *
-*  PARAMS: NONE
-*
-*  RETURNS:none
+*  RETURNS: nothing
 */
 void cron_job_list_init();
-/*
-*  SUMMARY: If the node count is zero then make id 0 to start over.
-*
-*  PARAMS: NONE
-*
-*  RETURNS: 0 on success, -1 on no action
-*/
 
-int cron_job_list_reset_id();
-
-#endif 
+#endif

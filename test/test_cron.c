@@ -30,14 +30,10 @@ TEST_CASE("**CRON_JOB - INFO -- INIT TEST, THIS INITIALIZES THE TIME DATA MAY LE
   struct timeval tv;
   tv.tv_sec = 1530000000; // SOMEWHERE IN JUNE 2018
   settimeofday(&tv, NULL);
-
 }
 
-
-
 TEST_CASE("**CRON_JOB - cron_job_schedule and cron_job_remove IS IT WORKING? ", "[cron_job]")
-{  
-
+{
   int cnt = 0, cnt2 = 0, ans = 0;
   cnt = cron_job_node_count();
   cron_job * job=cron_job_create("* * * * * *",NULL,NULL);
@@ -45,7 +41,7 @@ TEST_CASE("**CRON_JOB - cron_job_schedule and cron_job_remove IS IT WORKING? ", 
   TEST_ASSERT_MESSAGE(job != NULL, "INSERTION FAILED WITH ERRORS");
   TEST_ASSERT_EQUAL_INT_MESSAGE(cnt + 1, cnt2, "LIST DIDNT GROW");
   ans = cron_job_destroy(job);
-  cnt2 = cron_job_node_count();  
+  cnt2 = cron_job_node_count();
   TEST_ASSERT_EQUAL_INT_MESSAGE( 0, ans, "DESTROY FAILED WITH ERRORS");
   TEST_ASSERT_EQUAL_INT_MESSAGE(cnt, cnt2, "LIST DIDNT REDUCE");
 }
@@ -92,43 +88,137 @@ TEST_CASE("**CRON_JOB - cron_clear_all TEST CLEAR ALL JOBS ", "[cron_job]")
   TEST_ASSERT_EQUAL_INT_MESSAGE(0, cnt-cnt_init,"Destroy all call");
 }
 
-void test_cron_job_sample_callback(cron_job *job)
+TEST_CASE("**CRON_JOB - cron_job_reschedule_all recomputes schedules", "[cron_job]")
 {
-  time_t now;
-  struct tm timeinfo;
-  char buffer[256],buffer2[256];
-  int buffer_len = 256;
-  time(&now);
-  localtime_r(&now, &timeinfo);
-  strftime(buffer, buffer_len, "%c", &timeinfo);
-  localtime_r(&(job->next_execution), &timeinfo);
-  strftime(buffer2, buffer_len, "%c", &timeinfo);
-  job->data = job->data+5;
-  printf("CALLBACK RUNNED AT TIME: %s SHOULD RUN AT: %s WITH DATA: %d \n", buffer,buffer2,(unsigned int)job->data);
-  return;
-}
-
-TEST_CASE("**CRON_JOB - cron_schedule_task TEST IF THE SCHEDULER RUNS ONCE AND WITH EXPECTED RESULTS", "[cron_job]")
-{
-  time_t begin=1530000000;
-  const int seconds_to_run=10*2; //whatever you want to run must be twice because one for the delay and one for the callback :P 
-  cron_job * jobs[2];
   struct timeval tv;
-  tv.tv_sec = begin; // SOMEWHERE IN JUNE 2018
+  tv.tv_sec = 1530000000; // SOMEWHERE IN JUNE 2018
   settimeofday(&tv, NULL);
-  jobs[0]=cron_job_create("* * * * * *",test_cron_job_sample_callback,(void *)0);
-  jobs[1]=cron_job_create("*/5 * * * * *",test_cron_job_sample_callback,(void *)10000);
-  for (int i =0;i<seconds_to_run;i++) {
-   cron_schedule_task((void *)"R1"); // R1 = RUN ONCE SYNCRHONOUS MODE*/
-  }
-  TEST_ASSERT_MESSAGE((int)jobs[0]->data > 5*8, "Unexpected delay");//IT DEPENDS ON TIME MOST OF THE TIME WILL DO 45, SOME 40 AND OTHERS 50
-  TEST_ASSERT_MESSAGE((int)jobs[1]->data > 10005, "Unexpected delay"); // SOMETIMES IT RUNS TWICE BECAUSE OF BEGIN TIME 
-  cron_job_destroy(jobs[0]);
-  cron_job_destroy(jobs[1]);
-  //cron_job_clear_all();
+
+  cron_job * job = cron_job_create("* * * * * *", NULL, NULL);
+  TEST_ASSERT_NOT_NULL(job);
+
+  time_t before = job->next_execution;
+  int rc = cron_job_reschedule_all();
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, rc, "reschedule_all FAILED");
+  TEST_ASSERT_MESSAGE(job->next_execution >= before, "NEXT EXECUTION MOVED BACKWARD");
+
+  cron_job_destroy(job);
 }
 
+TEST_CASE("**CRON_JOB - remove last node in list", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
 
+  cron_job * last = cron_job_create("* * * * * *", NULL, NULL);
+  cron_job * first = cron_job_create("* * * * * *", NULL, NULL);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(2, cron_job_node_count(), "EXPECTED 2 NODES");
 
+  // 删除链表末尾节点
+  int rc = cron_job_unschedule(last);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, rc, "REMOVE LAST NODE FAILED");
+  TEST_ASSERT_EQUAL_INT_MESSAGE(1, cron_job_node_count(), "LIST SHOULD HAVE 1 NODE");
 
+  cron_job_destroy(first);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, cron_job_node_count(), "LIST SHOULD BE EMPTY");
+  cron_job_destroy(last);
+}
 
+TEST_CASE("**CRON_JOB - remove single node in list", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  cron_job * job = cron_job_create("* * * * * *", NULL, NULL);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(1, cron_job_node_count(), "EXPECTED 1 NODE");
+
+  int rc = cron_job_unschedule(job);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, rc, "REMOVE SINGLE NODE FAILED");
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, cron_job_node_count(), "LIST SHOULD BE EMPTY");
+
+  cron_job_destroy(job);
+}
+
+TEST_CASE("**CRON_JOB - start/stop idempotency", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  // 幂等 start：多次调用不应崩溃
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+  TEST_ASSERT_EQUAL_INT(0, cron_start()); // 幂等：返回 0
+  TEST_ASSERT_EQUAL_INT(0, cron_start()); // 幂等：返回 0
+
+  // 幂等 stop
+  TEST_ASSERT_EQUAL_INT(0, cron_stop());
+  TEST_ASSERT_EQUAL_INT(-1, cron_stop()); // 已停止：返回 -1
+
+  // start → stop → start 恢复
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+  TEST_ASSERT_EQUAL_INT(0, cron_stop());
+  TEST_ASSERT_EQUAL_INT(0, cron_start());
+  TEST_ASSERT_EQUAL_INT(0, cron_stop());
+}
+
+TEST_CASE("**CRON_JOB - create initializes cancelled flag", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  cron_job * job = cron_job_create("* * * * * *", NULL, NULL);
+  TEST_ASSERT_NOT_NULL(job);
+  TEST_ASSERT_FALSE(job->cancelled);
+  cron_job_destroy(job);
+}
+
+TEST_CASE("**CRON_JOB - remove earliest job updates next head", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000; // 2018-06-26
+  settimeofday(&tv, NULL);
+
+  cron_job * later = cron_job_create("0 0 13 * * *", NULL, NULL); // 13:00
+  cron_job * earlier = cron_job_create("0 0 12 * * *", NULL, NULL); // 12:00
+  TEST_ASSERT_NOT_NULL(later);
+  TEST_ASSERT_NOT_NULL(earlier);
+  TEST_ASSERT_EQUAL(2, cron_job_node_count());
+
+  // 最早的是 12:00 那个
+  TEST_ASSERT_EQUAL_PTR(earlier, cron_job_list_first()->job);
+
+  // 移除最早 job → 链表头应变为 13:00 那个
+  TEST_ASSERT_EQUAL_INT(0, cron_job_unschedule(earlier));
+  TEST_ASSERT_EQUAL(1, cron_job_node_count());
+  TEST_ASSERT_EQUAL_PTR(later, cron_job_list_first()->job);
+
+  cron_job_destroy(later);
+}
+
+TEST_CASE("**CRON_JOB - modify expression and reschedule", "[cron_job]")
+{
+  struct timeval tv;
+  tv.tv_sec = 1530000000;
+  settimeofday(&tv, NULL);
+
+  cron_job * job = cron_job_create("0 0 12 * * *", NULL, NULL);
+  TEST_ASSERT_NOT_NULL(job);
+  time_t old = job->next_execution;
+
+  // 先移除，再改表达式，再重新调度
+  cron_job_unschedule(job);
+  TEST_ASSERT_EQUAL_INT(0, cron_job_load_expression(job, "0 0 18 * * *"));
+  TEST_ASSERT_EQUAL_INT(1, cron_job_has_loaded(job));
+  TEST_ASSERT_EQUAL_INT(0, cron_job_schedule(job));
+
+  // next_execution 应指向新的 18:00，而不是原 12:00
+  struct tm timeinfo;
+  localtime_r(&job->next_execution, &timeinfo);
+  TEST_ASSERT_EQUAL_INT(18, timeinfo.tm_hour);
+  TEST_ASSERT_NOT_EQUAL(old, job->next_execution);
+
+  cron_job_destroy(job);
+}

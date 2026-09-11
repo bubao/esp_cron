@@ -21,50 +21,145 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "jobs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#define MIN_DELAY_US 1000 // 1ms，或根据需求调整
+// 运行统计（CONFIG_ESP_CRON_ENABLE_STATS 可选）
+#ifdef CONFIG_ESP_CRON_ENABLE_STATS
+typedef struct {
+    uint32_t executed;
+    uint32_t cancelled;      // 仅统计 destroy 后取消的 queued execution
+    uint32_t skipped_running; // 同一 job 正在执行而被跳过的触发
+    uint32_t queue_full;
+    uint32_t time_resync;
+    uint32_t runner_create_failed;
+} cron_stats_t;
+static cron_stats_t stats = {0};
+#endif
+
+// Kconfig 提供，未配置时使用默认值
+#ifndef CONFIG_ESP_CRON_WORKER_STACK_SIZE
+#define CONFIG_ESP_CRON_WORKER_STACK_SIZE 4096
+#endif
+#ifndef CONFIG_ESP_CRON_QUEUE_DEPTH
+#define CONFIG_ESP_CRON_QUEUE_DEPTH 10
+#endif
+#ifndef CONFIG_ESP_CRON_MAX_DUE_JOBS
+#define CONFIG_ESP_CRON_MAX_DUE_JOBS 16
+#endif
+#ifndef CONFIG_ESP_CRON_MIN_DELAY_US
+#define CONFIG_ESP_CRON_MIN_DELAY_US 1000
+#endif
+
+// ====================== 调度器状态 ========================
+
+typedef enum {
+    CRON_STATE_STOPPED = 0,
+    CRON_STATE_RUNNING,
+    CRON_STATE_STOPPING,  // 正在停止：不再接受新 job，已入队的执行完
+} cron_state_e;
 
 typedef struct {
-    unsigned char running;
+    cron_state_e state;
     TaskHandle_t handle;
     time_t seconds_until_next_execution;
     QueueHandle_t task_queue;
     esp_timer_handle_t esp_timer;
     int next_id;
+    bool time_baseline_valid; // 首次采样后置 true，避免 wall=0（1970）时误判跳变
+    int64_t last_monotonic_us;
+    time_t last_wall_time;
 } cron_state_t;
 
-static cron_state_t state = {
-    .running = 0,
+static cron_state_t cron = {
+    .state = CRON_STATE_STOPPED,
     .handle = NULL,
     .seconds_until_next_execution = -1,
     .task_queue = NULL,
     .esp_timer = NULL,
     .next_id = 1,
+    .time_baseline_valid = false,
+    .last_monotonic_us = 0,
+    .last_wall_time = 0,
 };
+
+// ====================== 互斥锁 ========================
+
+// 锁顺序规则（必须遵守，防止 ABBA 死锁）：
+//   s_mutex → s_ref_mutex → 链表内部 semaphore
+// 永远只能这个方向嵌套获取，禁止反向。
+
+// ===== refcount 所有权模型 =====
+//
+//   refs = 1    cron_job_create（调用者持有句柄引用）
+//   refs += 1   timer_cb 入队成功（queue 持有，s_mutex 内 ref_locked）
+//   refs -= 1   destroy / clear_all（释放创建/调度持有）
+//   refs -= 1   job_runner_task 回调结束（释放队列引用，所有权已从
+//               worker 转移给 runner，worker→runner 之间不重复 +1/-1）
+//   refs == 0   free(job)
+//
+// 关键不变量：
+//   - ref 只能在持有 s_mutex 时增加（cron_job_ref_locked），
+//     保证 timer_cb 拿到 job 指针后 destroy 无法提前 free
+//   - 链表本身不持有独立 ref；job 在链表内的安全性由
+//     @创建者句柄引用 + s_mutex 串行化 共同保证
+//   - runner 是 job 生命周期终结者：无论 callback 内发生什么
+//     （destroy 自己 / stop / clear_all），runner 最后执行 unref
+
+static SemaphoreHandle_t s_mutex = NULL;     // 保护链表、队列、状态
+static SemaphoreHandle_t s_ref_mutex = NULL;  // 保护 job->refs / running / cancelled
+
+static void cron_ensure_mutex(void)
+{
+    if (s_mutex == NULL)
+        s_mutex = xSemaphoreCreateMutex();
+    if (s_ref_mutex == NULL)
+        s_ref_mutex = xSemaphoreCreateMutex();
+}
+
+// ====================== 引用计数 ========================
+// 规则：s_mutex → s_ref_mutex（先拿大锁再拿小锁）
+
+static void cron_job_ref_locked(cron_job* job)
+{
+    // 必须在持有 s_mutex 时调用，防止 ref 与 destroy 竞态
+    xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+    job->refs++;
+    xSemaphoreGive(s_ref_mutex);
+}
+
+static void cron_job_unref(cron_job* job)
+{
+    int refs;
+    xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+    refs = --job->refs;
+    xSemaphoreGive(s_ref_mutex);
+    if (refs <= 0)
+        free(job);
+}
 
 // ====================== 内部工具 ========================
 
-static void schedule_next_timer();
+static void schedule_next_timer_locked();
+static int cron_job_reschedule_all_locked(void);
+static int cron_job_unschedule_locked(cron_job* job);
 
-// 判断 job 是否在链表中
 static int cron_job_exists_in_list(int id)
 {
     struct cron_job_node* node = cron_job_list_first();
     while (node) {
-        if (node->job && node->job->id == id) {
+        if (node->job && node->job->id == id)
             return 1;
-        }
         node = node->next;
     }
     return 0;
 }
 
-// 内部：不自动调度定时器的 job schedule
+// 不自动调度定时器的 job schedule（调用方需持有 s_mutex）
 static int cron_job_schedule_nosched(cron_job* job)
 {
     cron_job_list_init();
@@ -74,9 +169,8 @@ static int cron_job_schedule_nosched(cron_job* job)
     time(&now);
     job->next_execution = cron_next(&(job->expression), now);
     job->last_triggered_sec = -1;
-    if (cron_job_exists_in_list(job->id)) {
+    if (cron_job_exists_in_list(job->id))
         cron_job_list_remove(job->id);
-    }
     cron_job_list_insert(job);
     return 0;
 }
@@ -85,62 +179,142 @@ static int cron_job_schedule_nosched(cron_job* job)
 
 static void timer_cb(void* arg)
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    (void)arg;
     time_t now;
     time(&now);
     time_t now_sec = now;
 
-    cron_job* due_jobs[16];
+    cron_job* due_jobs[CONFIG_ESP_CRON_MAX_DUE_JOBS];
     int due_count = 0;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
     while (1) {
         struct cron_job_node* node = cron_job_list_first();
         if (!node || node->job->next_execution > now)
             break;
         cron_job* job = node->job;
+
+        // 防重入：同一 job 正在执行回调则跳过本次触发
+        // （灌溉场景：pump ON/OFF 序列不能被并发 runner 打乱）
+        xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+        bool is_running = job->running;
+        xSemaphoreGive(s_ref_mutex);
+        if (is_running) {
+#ifdef CONFIG_ESP_CRON_ENABLE_STATS
+            stats.skipped_running++; // 不计入 cancelled（语义不同）
+#endif
+            cron_job_list_remove(job->id);
+            if (due_count < CONFIG_ESP_CRON_MAX_DUE_JOBS)
+                due_jobs[due_count++] = job; // 重算 next_execution 推进到下次
+            continue;
+        }
+
         // 防抖：同一秒只触发一次
         if (job->last_triggered_sec == now_sec) {
             cron_job_list_remove(job->id);
-            if (due_count < 16)
+            if (due_count < CONFIG_ESP_CRON_MAX_DUE_JOBS)
                 due_jobs[due_count++] = job;
             continue;
         }
+
         job->last_triggered_sec = now_sec;
-        if (state.task_queue) {
-            xQueueSendFromISR(state.task_queue, &job, &xHigherPriorityTaskWoken);
+
+        // --- P0-1 修复：ref 必须在 s_mutex 保护内完成 ---
+        // 先 ref，再入队，再从链表移除。顺序不可颠倒。
+        cron_job_ref_locked(job);
+        if (cron.task_queue && xQueueSend(cron.task_queue, &job, 0) == pdTRUE) {
+            // 入队成功：队列持有引用，回调执行完由 worker unref
+        } else {
+            // --- P0-3 修复：Queue 满时 unref + 日志，不静默丢弃 ---
+            printf("esp_cron: queue full, job %d dropped\n", job->id);
+#ifdef CONFIG_ESP_CRON_ENABLE_STATS
+            stats.queue_full++;
+#endif
+            cron_job_unref(job); // 入队失败，释放 ref
         }
         cron_job_list_remove(job->id);
-        if (due_count < 16)
+        if (due_count < CONFIG_ESP_CRON_MAX_DUE_JOBS)
             due_jobs[due_count++] = job;
     }
-    for (int i = 0; i < due_count; ++i) {
-        cron_job_schedule_nosched(due_jobs[i]); // 不自动调度定时器
-    }
-    schedule_next_timer(); // 只调度一次
-    if (xHigherPriorityTaskWoken)
-        portYIELD_FROM_ISR();
+
+    for (int i = 0; i < due_count; ++i)
+        cron_job_schedule_nosched(due_jobs[i]);
+
+    schedule_next_timer_locked();
+    xSemaphoreGive(s_mutex);
 }
 
-static void schedule_next_timer()
+// 锁内轻量函数契约：本函数只做「读链表 head + time() + esp_timer 控制」。
+// 禁止在其内引入 xQueueSend / callback / free / xTaskCreate，
+// 否则 s_mutex 锁内挂载长操作会使锁关系复杂化并阻塞调度。
+// (调用方必须持有 s_mutex)
+static void schedule_next_timer_locked()
 {
     struct cron_job_node* node = cron_job_list_first();
     cron_job* job = node ? node->job : NULL;
     if (!job) {
-        if (state.esp_timer)
-            esp_timer_stop(state.esp_timer);
+        if (cron.esp_timer)
+            esp_timer_stop(cron.esp_timer);
         return;
     }
 
+    // --- 时间跳变检测：比较墙钟增量与单调时钟增量 ---
+    // 正常运行时两者同步前进（Δwall ≈ Δmono，均等于定时器间隔）。
+    // SNTP 拨正 / settimeofday 只影响墙钟，导致两者出现明显差值。
+    // 首次采样只建立 baseline；SNTP 首次同步从 1970 → 当前时间时，
+    // 用户应主动调用 cron_job_reschedule_all() 重建 baseline。
     time_t now;
     time(&now);
+    int64_t mono_now_us = esp_timer_get_time();
+    if (!cron.time_baseline_valid) {
+        cron.time_baseline_valid = true;
+        cron.last_wall_time = now;
+        cron.last_monotonic_us = mono_now_us;
+    } else {
+        int64_t dwall_us = (now - cron.last_wall_time) * 1000000LL;
+        int64_t dmono_us = mono_now_us - cron.last_monotonic_us;
+        int64_t delta_us = dmono_us - dwall_us;
+        if (delta_us > 2000000LL || delta_us < -2000000LL) { // |Δ| > 2s
+            if (cron_job_reschedule_all_locked() == 0) {
+#ifdef CONFIG_ESP_CRON_ENABLE_STATS
+                stats.time_resync++;
+#endif
+                node = cron_job_list_first();
+                job = node ? node->job : NULL;
+                if (!job) {
+                    if (cron.esp_timer)
+                        esp_timer_stop(cron.esp_timer);
+                    return;
+                }
+            }
+            // 重建 baseline：防止跳变在每次 timer_cb 上重复触发
+            cron.last_wall_time = now;
+            cron.last_monotonic_us = mono_now_us;
+        }
+        cron.last_monotonic_us = mono_now_us;
+        cron.last_wall_time = now;
+    }
 
-    int64_t delay_us = (job->next_execution - now) * 1000000;
-    if (delay_us < MIN_DELAY_US)
-        delay_us = MIN_DELAY_US;
+    int64_t delay_us = (job->next_execution - now) * 1000000LL;
 
-    esp_timer_stop(state.esp_timer);
-    esp_timer_start_once(state.esp_timer, delay_us);
+    // --- P0-4 修复：delay < MIN_DELAY 时强制 clamp ---
+    if (delay_us < CONFIG_ESP_CRON_MIN_DELAY_US)
+        delay_us = CONFIG_ESP_CRON_MIN_DELAY_US;
 
-    state.seconds_until_next_execution = job->next_execution - now;
+    esp_timer_stop(cron.esp_timer);
+    esp_timer_start_once(cron.esp_timer, delay_us);
+
+    cron.seconds_until_next_execution = job->next_execution - now;
+}
+
+static void schedule_next_timer()
+{
+    if (!s_mutex)
+        return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    schedule_next_timer_locked();
+    xSemaphoreGive(s_mutex);
 }
 
 // ====================== worker task ========================
@@ -149,28 +323,51 @@ static void job_runner_task(void* arg)
 {
     cron_job* job = (cron_job*)arg;
 
-    TickType_t start_tick = xTaskGetTickCount();
+    // runner 是 job 生命周期终结者：先置 running（防重入），
+    // 执行 callback，最后清除 running 并 unref。无论 callback
+    // 内发生什么（destroy 自己 / stop / clear_all），此处都执行。
+    if (job && !job->cancelled && job->callback) {
+        xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+        job->running = true;
+        xSemaphoreGive(s_ref_mutex);
 
-    if (job && job->callback) {
         job->callback(job);
+
+        xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+        job->running = false;
+        xSemaphoreGive(s_ref_mutex);
+#ifdef CONFIG_ESP_CRON_ENABLE_STATS
+        stats.executed++;
+#endif
+    } else if (job && job->cancelled) {
+#ifdef CONFIG_ESP_CRON_ENABLE_STATS
+        stats.cancelled++;
+#endif
     }
 
-    TickType_t elapsed = xTaskGetTickCount() - start_tick;
-    if (elapsed > pdMS_TO_TICKS(5000)) { // 比如超过 5 秒
-        printf("Warning: cron job %d callback took too long \n", job->id);
-    }
-
+    cron_job_unref(job);
     vTaskDelete(NULL);
 }
 
 static void cron_worker_task(void* arg)
 {
+    // worker 与队列 1:1 绑定：队列句柄由 cron_start 传入，不读全局状态
+    QueueHandle_t queue = (QueueHandle_t)arg;
     cron_job* job = NULL;
     while (1) {
-        if (state.task_queue && xQueueReceive(state.task_queue, &job, portMAX_DELAY)) {
+        if (xQueueReceive(queue, &job, portMAX_DELAY)) {
             if (job) {
-                // 在单独任务中执行 job.callback
-                xTaskCreate(job_runner_task, "job_runner", 4096, job, tskIDLE_PRIORITY + 1, NULL);
+                // runner 创建失败时必须释放队列持有的引用，
+                // 否则该 job 的 refs 永远不会归零 → 内存泄漏
+                if (xTaskCreate(job_runner_task, "job_runner",
+                                CONFIG_ESP_CRON_WORKER_STACK_SIZE,
+                                job, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+                    printf("esp_cron: failed to create runner task, job %d dropped\n", job->id);
+#ifdef CONFIG_ESP_CRON_ENABLE_STATS
+                    stats.runner_create_failed++;
+#endif
+                    cron_job_unref(job);
+                }
             }
         }
     }
@@ -180,15 +377,23 @@ static void cron_worker_task(void* arg)
 
 cron_job* cron_job_create(const char* schedule, cron_job_callback callback, void* data)
 {
-    cron_job* job = calloc(1, sizeof(cron_job));
-    if (!job) {
-        printf("Failed to allocate memory for cron job\n");
+    if (!schedule)
         return NULL;
-    }
+
+    cron_ensure_mutex();
+
+    cron_job* job = calloc(1, sizeof(cron_job));
+    if (!job)
+        return NULL;
 
     job->callback = callback;
     job->data = data;
-    job->id = state.next_id++;
+    job->refs = 1;
+    job->cancelled = false;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    job->id = cron.next_id++;
+    xSemaphoreGive(s_mutex);
 
     if (cron_job_load_expression(job, schedule) != 0) {
         free(job);
@@ -207,41 +412,130 @@ int cron_job_destroy(cron_job* job)
 {
     if (!job)
         return -1;
-    cron_job_unschedule(job);
-    free(job);
+
+    cron_ensure_mutex();
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    // --- P0-2 修复：标记 cancelled，阻止已入队 job 执行 callback ---
+    job->cancelled = true;
+
+    cron_job_unschedule_locked(job);
+    xSemaphoreGive(s_mutex);
+
+    // 调用者释放引用；若在队列中，由 worker 消费后释放
+    cron_job_unref(job);
     return 0;
 }
 
 int cron_job_clear_all()
 {
-    cron_job_list_init(); // 确保链表和信号量已初始化
+    cron_job_list_init();
+    cron_ensure_mutex();
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
     while (cron_job_list_first()) {
-        cron_job_destroy(cron_job_list_first()->job);
+        cron_job* job = cron_job_list_first()->job;
+        cron_job_list_remove(job->id);
+        job->cancelled = true;
+        cron_job_unref(job);
     }
+
+    // 运行中清空：立即重设定时器（空链表会停止它）
+    if (cron.state == CRON_STATE_RUNNING)
+        schedule_next_timer_locked();
+
+    xSemaphoreGive(s_mutex);
     return 0;
 }
 
-int cron_stop()
+static int cron_job_reschedule_all_locked(void)
 {
-    if (!state.running)
+    int n = cron_job_node_count();
+    if (n == 0)
+        return 0;
+
+    cron_job** jobs = calloc(n, sizeof(cron_job*));
+    if (!jobs)
         return -1;
 
-    state.running = 0;
-    if (state.handle) {
-        vTaskDelete(state.handle);
-        state.handle = NULL;
+    int count = 0;
+    struct cron_job_node* node = cron_job_list_first();
+    while (node) {
+        jobs[count++] = node->job;
+        node = node->next;
     }
 
-    if (state.esp_timer) {
-        esp_timer_stop(state.esp_timer);
-        esp_timer_delete(state.esp_timer);
-        state.esp_timer = NULL;
+    for (int i = 0; i < count; ++i)
+        cron_job_schedule_nosched(jobs[i]);
+
+    free(jobs);
+    return 0;
+}
+
+int cron_job_reschedule_all()
+{
+    cron_job_list_init();
+    cron_ensure_mutex();
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int rc = cron_job_reschedule_all_locked();
+    // 手动重排（如 SNTP 同步后）视为"我已知时间变了"：
+    // 重置 baseline，由下一次 timer_cb 重建，避免随后自动检测误触发。
+    cron.time_baseline_valid = false;
+    cron.last_wall_time = 0;
+    cron.last_monotonic_us = 0;
+    xSemaphoreGive(s_mutex);
+    return rc;
+}
+
+// --- P1-1 修复：start/stop 幂等性 ---
+// cron_start: 已运行则返回 0（幂等）
+// cron_stop:  停止后清理所有 job，再次 stop 返回 -1（未运行）
+int cron_stop()
+{
+    if (!s_mutex)
+        return -1;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    if (cron.state != CRON_STATE_RUNNING) {
+        xSemaphoreGive(s_mutex);
+        return -1;
     }
 
-    if (state.task_queue) {
-        vQueueDelete(state.task_queue);
-        state.task_queue = NULL;
+    // 同步语义：cron_stop() 返回时调度器已 STOPPED——
+    // timer/worker/queue 全部清理完成，随后 start 是可靠的。
+    // 注意：不等待正在执行的 callback（不强杀 runner task），
+    // 由 refcount 保证其安全收尾。
+    cron.state = CRON_STATE_STOPPING;
+
+    // 停止 worker 接收新的 job（先删任务，再删队列）
+    if (cron.handle) {
+        vTaskDelete(cron.handle);
+        cron.handle = NULL;
     }
+
+    if (cron.esp_timer) {
+        esp_timer_stop(cron.esp_timer);
+        esp_timer_delete(cron.esp_timer);
+        cron.esp_timer = NULL;
+    }
+
+    // 排空队列中未消费的引用
+    if (cron.task_queue) {
+        cron_job* pending = NULL;
+        while (xQueueReceive(cron.task_queue, &pending, 0) == pdTRUE) {
+            if (pending)
+                cron_job_unref(pending);
+        }
+        vQueueDelete(cron.task_queue);
+        cron.task_queue = NULL;
+    }
+
+    cron.state = CRON_STATE_STOPPED;
+    xSemaphoreGive(s_mutex);
 
     cron_job_clear_all();
     return 0;
@@ -249,19 +543,34 @@ int cron_stop()
 
 int cron_start()
 {
-    cron_job_list_init(); // 确保链表和信号量已初始化
-    if (state.running || state.handle)
-        return -1;
+    cron_job_list_init();
+    cron_ensure_mutex();
 
-    state.task_queue = xQueueCreate(10, sizeof(cron_job*));
-    if (!state.task_queue) {
-        printf("Failed to create task queue\n");
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    // 幂等：已运行则直接返回成功
+    if (cron.state == CRON_STATE_RUNNING) {
+        xSemaphoreGive(s_mutex);
+        return 0;
+    }
+
+    // 等待 STOPPING 完成（理论上不应发生，但防御性处理）
+    if (cron.state == CRON_STATE_STOPPING) {
+        xSemaphoreGive(s_mutex);
         return -1;
     }
 
-    if (xTaskCreate(cron_worker_task, "cron_worker", 4096, NULL, tskIDLE_PRIORITY + 2, &state.handle) != pdPASS) {
-        printf("Failed to create cron worker task\n");
-        vQueueDelete(state.task_queue);
+    cron.task_queue = xQueueCreate(CONFIG_ESP_CRON_QUEUE_DEPTH, sizeof(cron_job*));
+    if (!cron.task_queue) {
+        xSemaphoreGive(s_mutex);
+        return -1;
+    }
+
+    if (xTaskCreate(cron_worker_task, "cron_worker", CONFIG_ESP_CRON_WORKER_STACK_SIZE,
+                    cron.task_queue, tskIDLE_PRIORITY + 2, &cron.handle) != pdPASS) {
+        vQueueDelete(cron.task_queue);
+        cron.task_queue = NULL;
+        xSemaphoreGive(s_mutex);
         return -1;
     }
 
@@ -270,57 +579,85 @@ int cron_start()
         .name = "cron_timer"
     };
 
-    if (esp_timer_create(&timer_args, &state.esp_timer) != ESP_OK) {
-        vTaskDelete(state.handle);
-        vQueueDelete(state.task_queue);
+    if (esp_timer_create(&timer_args, &cron.esp_timer) != ESP_OK) {
+        vTaskDelete(cron.handle);
+        cron.handle = NULL;
+        vQueueDelete(cron.task_queue);
+        cron.task_queue = NULL;
+        xSemaphoreGive(s_mutex);
         return -1;
     }
 
-    state.running = 1;
+    cron.state = CRON_STATE_RUNNING;
+    xSemaphoreGive(s_mutex);
+
     schedule_next_timer();
     return 0;
 }
 
 int cron_job_schedule(cron_job* job)
 {
-    cron_job_list_init(); // 确保链表和信号量已初始化
-    if (!job || !cron_job_has_loaded(job))
+    cron_job_list_init();
+    cron_ensure_mutex();
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    if (!job || !cron_job_has_loaded(job) || job->cancelled) {
+        xSemaphoreGive(s_mutex);
         return -1;
+    }
 
     time_t now;
     time(&now);
 
     job->next_execution = cron_next(&(job->expression), now);
-    job->last_triggered_sec = -1; // 每次重新调度时重置
-    // 防止重复插入，先判断是否存在再移除
-    if (cron_job_exists_in_list(job->id)) {
+    job->last_triggered_sec = -1;
+    if (cron_job_exists_in_list(job->id))
         cron_job_list_remove(job->id);
-    }
     cron_job_list_insert(job);
 
-    // 如果当前 job 是下一个要执行的，重新调度定时器
     struct cron_job_node* node = cron_job_list_first();
-    if (node && node->job == job) {
-        schedule_next_timer();
-    }
+    if (node && node->job == job)
+        schedule_next_timer_locked();
 
+    xSemaphoreGive(s_mutex);
     return 0;
+}
+
+// 内部版：调用方须持有 s_mutex
+static int cron_job_unschedule_locked(cron_job* job)
+{
+    struct cron_job_node* head = cron_job_list_first();
+    int was_head = (head && head->job == job) ? 1 : 0;
+
+    int rc = 0;
+    if (cron_job_exists_in_list(job->id))
+        rc = cron_job_list_remove(job->id);
+
+    // 移除的是下一个要触发的 job：立即重设定时器到新的最早时刻，
+    // 避免 esp_timer 仍睡到被移除 job 的时间（多一次无谓唤醒）
+    if (was_head && rc == 0)
+        schedule_next_timer_locked();
+
+    return rc;
 }
 
 int cron_job_unschedule(cron_job* job)
 {
-    cron_job_list_init(); // 确保链表和信号量已初始化
+    cron_job_list_init();
+    cron_ensure_mutex();
     if (!job)
         return -1;
-    if (cron_job_exists_in_list(job->id)) {
-        return cron_job_list_remove(job->id);
-    }
-    return 0;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int rc = cron_job_unschedule_locked(job);
+    xSemaphoreGive(s_mutex);
+    return rc;
 }
 
 int cron_job_load_expression(cron_job* job, const char* schedule)
 {
-    if (!job || !schedule)
+    if (!job || !schedule || job->cancelled) // destroy 是终态
         return -1;
 
     memset(&(job->expression), 0, sizeof(job->expression));
@@ -332,74 +669,16 @@ int cron_job_load_expression(cron_job* job, const char* schedule)
         return -1;
     }
 
-    job->load = &(job->expression);
+    job->loaded = true;
     return 0;
 }
 
 int cron_job_has_loaded(cron_job* job)
 {
-    return job && (job->load == &(job->expression));
+    return job && job->loaded;
 }
 
 time_t cron_job_seconds_until_next_execution()
 {
-    return state.seconds_until_next_execution;
-}
-
-// CRON TASKS
-
-void cron_schedule_job_launcher(void* args)
-{
-    if (args == NULL) {
-        goto end;
-    }
-    cron_job* job = (cron_job*)args;
-    job->callback(job);
-    goto end;
-
-end:
-    vTaskDelete(NULL);
-    return;
-}
-
-void cron_schedule_task(void* args)
-{
-    time_t now;
-    cron_job* job = NULL;
-    int r1 = 0; // RUN ONCE!!
-                // IF ARGS ARE A STRING DEFINED AS R1
-    if (args != NULL) {
-        if (strncmp(args, "R1", 2) == 0) // OK I ADMIT IT, ITS NOT THE MOST BEAUTIFUL CODE EVER, BUT I NEED IT TO BE TESTABLE... DON'T WANT TO GROW OLD WAITING FOR TIME TO PASS... :P
-            r1 = 1;
-    }
-
-    while (true) {
-        state.running = 1;
-        time(&now);
-        job = cron_job_list_first()->job;
-        if (job == NULL) {
-            break; // THIS IS IT!!! THIS WILL
-        }
-        if (now >= job->next_execution) {
-            /* Create the task, IT WILL KILL ITSELF AFTER THE JOB IS DONE. */
-            xTaskCreatePinnedToCore(
-                cron_schedule_job_launcher, /* Function that implements the task. */
-                "cron_schedule_job_launcher", /* Text name for the task. */
-                4096, /* Stack size in BYTES, not bytes. */
-                (void*)job, /* Job is passed into the task. */
-                tskIDLE_PRIORITY + 2, /* Priority at which the task is created. */
-                (NULL), /* No need for the handle */
-                tskNO_AFFINITY); /* No specific core */
-            cron_job_list_remove(job->id); // There is mutex in there that can mess with our timing, but i am not sure if we should move this to the new task.
-            cron_job_schedule(job); // There is mutex in there that can mess with our timing, but i am not sure if we should move this to the new task.
-        } else {
-            state.seconds_until_next_execution = job->next_execution - now;
-            vTaskDelay((state.seconds_until_next_execution * 1000) / portTICK_PERIOD_MS);
-        }
-        if (r1 != 0) {
-            break;
-        }
-    }
-    cron_stop();
-    return;
+    return cron.seconds_until_next_execution;
 }

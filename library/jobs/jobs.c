@@ -16,149 +16,113 @@
 //
 // Author: David Mora Rodriguez dmorar (at) insite.com.co
 //
+#include "jobs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <stdlib.h>
-#include "jobs.h"
 
-// STATIC FUNCTION DECLARATIONS
-struct cron_job_node *_cron_job_list_insert(struct cron_job_node *next_node, struct cron_job_node *new_node);
 // STATIC STRUCTS
 static struct
 {
-  int next_id;
-  struct cron_job_node *first;
-  SemaphoreHandle_t semaphore;
-  int init;
-
-} linked_link_state = {
-    .next_id = 0,
+    struct cron_job_node* first;
+    SemaphoreHandle_t semaphore;
+    int init;
+} linked_list_state = {
     .first = NULL,
     .semaphore = NULL,
     .init = 0
-    };
+};
 
 void cron_job_list_init()
 {
-  if (linked_link_state.init == 0) {
-    linked_link_state.semaphore = xSemaphoreCreateMutex();
-    linked_link_state.init=1;
-  }
+    if (linked_list_state.init == 0) {
+        linked_list_state.semaphore = xSemaphoreCreateMutex();
+        linked_list_state.init = 1;
+    }
 }
 
-struct cron_job_node *cron_job_list_first()
+struct cron_job_node* cron_job_list_first()
 {
-  return linked_link_state.first;
+    return linked_list_state.first;
 }
 
-/* RECURSIVE BUT STACK EXHAUSTION? */
-struct cron_job_node *_cron_job_list_insert(struct cron_job_node *next_node, struct cron_job_node *new_node)
+/* 迭代插入，避免递归栈溢出 */
+static struct cron_job_node* _cron_job_list_insert(struct cron_job_node* head, struct cron_job_node* new_node)
 {
-  if (next_node == NULL || new_node->job->next_execution < next_node->job->next_execution)
-  {
-    new_node->next = next_node;
-    return new_node;
-  }
-  else
-  {
-    next_node->next = _cron_job_list_insert(next_node->next, new_node);
-  }
-  return next_node;
+    if (head == NULL || new_node->job->next_execution < head->job->next_execution) {
+        new_node->next = head;
+        return new_node;
+    }
+
+    struct cron_job_node* current = head;
+    while (current->next != NULL && current->next->job->next_execution <= new_node->job->next_execution) {
+        current = current->next;
+    }
+
+    new_node->next = current->next;
+    current->next = new_node;
+    return head;
 }
 
-int cron_job_list_insert(cron_job *job)
+int cron_job_list_insert(cron_job* job)
 {
-  if (linked_link_state.semaphore == NULL)
-    cron_job_list_init();
-  if (job == NULL)
-  {
-    return -1;
-  }
-  struct cron_job_node *new_node = calloc(1, sizeof(struct cron_job_node));
-  if (new_node == NULL)
-  {
-    return -1;
-  }
-  new_node->job = job;
-  if (xSemaphoreTake(linked_link_state.semaphore, (TickType_t)10) == pdTRUE)
-  {
-    linked_link_state.first = _cron_job_list_insert(linked_link_state.first, new_node);
-    xSemaphoreGive(linked_link_state.semaphore);
-  }
-  else
-  {
-    free(new_node);
-    return -1;
-  }
-  if (new_node->job->id == -1) // NOT INITIALIZED ON -1
-    new_node->job->id = linked_link_state.next_id++;
-  return new_node->job->id;
+    if (linked_list_state.semaphore == NULL)
+        cron_job_list_init();
+    if (job == NULL)
+        return -1;
+
+    struct cron_job_node* new_node = calloc(1, sizeof(struct cron_job_node));
+    if (new_node == NULL)
+        return -1;
+
+    new_node->job = job;
+    if (xSemaphoreTake(linked_list_state.semaphore, (TickType_t)10) == pdTRUE) {
+        linked_list_state.first = _cron_job_list_insert(linked_list_state.first, new_node);
+        xSemaphoreGive(linked_list_state.semaphore);
+    } else {
+        free(new_node);
+        return -1;
+    }
+    return new_node->job->id;
 }
 
 int cron_job_list_remove(int id)
 {
-  int ret = -1;
-  struct cron_job_node *node = linked_link_state.first, *prev_node = NULL;
-  if (xSemaphoreTake(linked_link_state.semaphore, (TickType_t)10) == pdTRUE) 
-  {
-    do
-    {
-      if (node->job->id == id)
-      {
-        if (node == linked_link_state.first)
-        {
-          linked_link_state.first = node->next;
-        }
-        else
-        {
-          prev_node->next = node->next;
-        }
-        free(node);
-        node = NULL;
+    if (linked_list_state.semaphore == NULL)
+        cron_job_list_init();
 
-        ret = 0;
-        break;
-      }
-      else
-      {
+    if (xSemaphoreTake(linked_list_state.semaphore, (TickType_t)10) != pdTRUE)
+        return -1;
+
+    struct cron_job_node* node = linked_list_state.first;
+    struct cron_job_node* prev_node = NULL;
+
+    while (node) {
+        if (node->job->id == id) {
+            if (prev_node == NULL)
+                linked_list_state.first = node->next;
+            else
+                prev_node->next = node->next;
+            free(node);
+            node = NULL;
+            xSemaphoreGive(linked_list_state.semaphore);
+            return 0;
+        }
         prev_node = node;
         node = node->next;
-      }
+    }
 
-    } while (node->next);
-    xSemaphoreGive(linked_link_state.semaphore);
-  }
-  else
-  {
-    ret = -1;
-  }
-  return ret;
+    xSemaphoreGive(linked_list_state.semaphore);
+    return -1;
 }
 
 int cron_job_node_count()
 {
-  int cnt = 0;
-  struct cron_job_node *node = cron_job_list_first();
-  if (node == NULL)
-  {
-    cnt = 0;
-  }
-  else
-  {
-    do
-    {
-      cnt++;
-      node = node->next;
-    } while (node);
-  }
-  return cnt;
-}
-
-
-int cron_job_list_reset_id(){
-  if (cron_job_node_count()==0) {
-    linked_link_state.next_id=0;
-    return 0;
+    int cnt = 0;
+    struct cron_job_node* node = cron_job_list_first();
+    while (node) {
+        cnt++;
+        node = node->next;
     }
-  return -1;
+    return cnt;
 }

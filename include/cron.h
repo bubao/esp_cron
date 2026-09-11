@@ -20,6 +20,7 @@
 #ifndef ESP_CRON_JOB
 #define ESP_CRON_JOB
 #include "freertos/FreeRTOS.h"
+#include <stdbool.h>
 #include <string.h>
 #include "ccronexpr.h"
 
@@ -56,9 +57,12 @@ struct cron_job_struct
   cron_expr expression;
   void * data;
   int id;
-  void * load;
+  int refs;         // 引用计数：创建=1，入队+1，消费后-1，归零由持有者释放
+  bool loaded;      // 表达式是否已成功解析
+  bool cancelled;   // 标记取消：destroy 后已入队 job 不执行 callback
+  bool running;     // 正在执行回调（防重入：再到期时跳过本次触发）
   time_t next_execution;
-  time_t last_triggered_sec; // 新增：防抖用，记录上次触发的秒
+  time_t last_triggered_sec; // 防抖：记录上次触发的秒
 };
 
 
@@ -96,6 +100,16 @@ int cron_job_destroy(cron_job * job);
 */
 
 int cron_job_clear_all();
+
+/*
+*  SUMMARY: Reschedules all jobs based on current system time.
+*  Call this after system time changes (e.g. SNTP sync completes) so that
+*  next_execution values are recomputed from the corrected clock.
+*
+*  RETURNS:  0 on success, -1 on allocation failure
+*/
+
+int cron_job_reschedule_all();
 
 /*
 *  SUMMARY: Starts the schedule module (creates a new task on the operating system)
@@ -146,15 +160,6 @@ int cron_job_unschedule(cron_job * job);
 time_t cron_job_seconds_until_next_execution();
 
 /*
-*  SUMARY: TASK SCHEDULER WITH DELAYS AND CALL TO CALLBACKS DO NOT RUN THIS TAST
-*  
-*  PARAMS: ARGS MUST BE NULL IN REGULAR USE, IF YOU WANT TO RUN JUST ONCE ARGS MUST BE A CHAR POINTER TO "R1" LITERAL
-*
-*  RETURNS: NO RETURN
-*/
-
-void cron_schedule_task(void *args);
-/*
 *  SUMARY: Parses cron expression and sets the state structure
 *
 *  PARAMS: Cron job structure
@@ -170,14 +175,6 @@ int cron_job_load_expression(cron_job *job, const char * schedule);
 *  RETURNS: 1 if it has loaded, 0 on error
 */
 int cron_job_has_loaded(cron_job *job);
-/*
-*  SUMARY: Returns seconds until next execution
-*  
-*  PARAMS: NONE
-*
-*  RETURNS: seconds until next execution
-*/
-time_t cron_job_seconds_until_next_execution();
 
 
 

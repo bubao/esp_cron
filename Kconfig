@@ -6,4 +6,40 @@ config ESP_CRON_ENABLE
     help
         Enable or disable the esp_cron component.
 
+if ESP_CRON_ENABLE
+
+config ESP_CRON_WORKER_STACK_SIZE
+    int "Cron worker/runner task stack size (bytes)"
+    default 4096
+    help
+        Stack size for the cron worker task and per-job runner tasks.
+
+config ESP_CRON_QUEUE_DEPTH
+    int "Worker task queue depth"
+    default 10
+    help
+        Maximum number of due jobs that can be queued at once.
+
+config ESP_CRON_MAX_DUE_JOBS
+    int "Maximum due jobs handled per timer callback"
+    default 16
+    help
+        Maximum number of jobs processed in a single timer callback.
+
+config ESP_CRON_MIN_DELAY_US
+    int "Minimum timer delay (microseconds)"
+    default 1000
+    help
+        Lower bound for the esp_timer one-shot delay. Keeps rapid
+        re-fires (e.g. sub-second cron) from thrashing the timer.
+
+config ESP_CRON_ENABLE_STATS
+    bool "Enable runtime statistics"
+    default n
+    help
+        Track execution counts, queue full events, and time resyncs.
+        Adds ~40 bytes of RAM. Disable in production if not needed.
+
+endif # ESP_CRON_ENABLE
+
 endmenu
