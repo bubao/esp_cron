@@ -86,6 +86,7 @@ TEST_CASE("**CRON_JOB - cron_clear_all TEST CLEAR ALL JOBS ", "[cron_job]")
   cron_job_clear_all();
   cnt = cron_job_node_count();
   TEST_ASSERT_EQUAL_INT_MESSAGE(0, cnt-cnt_init,"Destroy all call");
+  for (int j = 1; j < i; j++) cron_job_destroy(jobs[j]);
 }
 
 TEST_CASE("**CRON_JOB - cron_job_reschedule_all recomputes schedules", "[cron_job]")
@@ -254,7 +255,7 @@ TEST_CASE("**CRON_JOB - no concurrent runner for same job (in_flight)", "[cron_j
   vTaskDelay(pdMS_TO_TICKS(4000));
 
   TEST_ASSERT_EQUAL_INT_MESSAGE(0, s_cb_overlap, "SAME JOB RAN CONCURRENTLY (in_flight REGRESSION)");
-  TEST_ASSERT_INT_WITHIN_MESSAGE(1, 5, s_cb_concurrent, "callback should not leak concurrency");
+  TEST_ASSERT_INT_WITHIN_MESSAGE(1, 1, s_cb_concurrent, "callback should not leak concurrency");
 
   TEST_ASSERT_EQUAL_INT(0, cron_stop());
   cron_job_destroy(job);

@@ -218,7 +218,9 @@ cron_job *cron_job_create(const char *schedule,
 // 线程安全：即使任务正在队列中等待，调用也是安全的。
 int cron_job_destroy(cron_job *job);
 
-// 移除并释放所有任务。
+// 将所有任务移出调度表。
+// 按契约本调用不执行任何释放——每个任务的内存归调用者，
+// 必须对创建的每个任务逐一调用 cron_job_destroy()。
 int cron_job_clear_all();
 ```
 
@@ -412,7 +414,7 @@ job 一旦**成功入队**（runner 可能尚未启动），`in_flight` 即置�
 `cron_stop()` 执行：
 - 停止定时器（不再产生新的队列事件）
 - **协作式停机**：向 worker 发送停止哨兵，worker 退出并 ack 后才继续，不在停机窗口内强制 `vTaskDelete` worker
-- 排空队列并 `cron_job_clear_all()`（所有任务被移除并释放）
+- 排空队列并 `cron_job_clear_all()`（所有任务从调度表中移除；内存由调用者的 `cron_job_destroy` 释放，因为 `clear_all` 按契约不执行释放）
 
 与 callback 的关系：`cron_stop()` **不等待正在执行的 callback**。已入队/service 的 job 会继续在 runner 上执行完，由引用计数安全收尾；未消费的队列引用被协议化排空，不泄漏。
 

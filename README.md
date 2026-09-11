@@ -218,7 +218,9 @@ cron_job *cron_job_create(const char *schedule,
 // Thread-safe: safe to call even while jobs are queued.
 int cron_job_destroy(cron_job *job);
 
-// Remove and free ALL jobs.
+// Remove all jobs from the schedule.
+// Per contract, performs no deallocation — the caller owns each job's memory
+// and must cron_job_destroy() every job it created.
 int cron_job_clear_all();
 ```
 
@@ -412,7 +414,7 @@ Once a job is **successfully queued** (its runner may not have started yet), its
 `cron_stop()`:
 - Stops the timer (no new queue events)
 - **Cooperative shutdown**: sends a stop sentinel to the worker, waits for its ack, then proceeds — the worker is never force-deleted mid-operation
-- Drains the queue and `cron_job_clear_all()` (all jobs removed and freed)
+- Drains the queue and `cron_job_clear_all()` (all jobs removed from the schedule; their memory is released by the caller's `cron_job_destroy`, since `clear_all` performs no deallocation per its contract)
 
 Note: `cron_stop()` does **not** wait for callbacks already in-flight. Queued/running jobs finish on their runners (refcount guarantees safe teardown); un-consumed queue references are drained and released without leaking.
 

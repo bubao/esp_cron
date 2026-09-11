@@ -78,7 +78,7 @@ esp_timer_start_once(delay_us)  → 等到那个时刻
 ```
 refs = 1    cron_job_create() 返回（调用者持有）
 refs += 1   timer_cb 入队成功（queue 持有，s_mutex 内 +1）
-refs -= 1   destroy / clear_all（释放调用者持有）
+refs -= 1   destroy（释放调用者持有）
 refs -= 1   runner task 回调结束（释放 queue 持有）
 refs == 0   free(job) —— 自动释放，不需要 join
 ```

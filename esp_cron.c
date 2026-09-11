@@ -97,7 +97,7 @@ static cron_state_t cron = {
 //
 //   refs = 1    cron_job_create（调用者持有句柄引用）
 //   refs += 1   timer_cb 入队成功（queue 持有，s_mutex 内 ref_locked）
-//   refs -= 1   destroy / clear_all（释放创建/调度持有）
+//   refs -= 1   destroy（释放调用者持有句柄）
 //   refs -= 1   job_runner_task 回调结束（释放队列引用，所有权已从
 //               worker 转移给 runner，worker→runner 之间不重复 +1/-1）
 //   refs == 0   free(job)
@@ -458,7 +458,6 @@ int cron_job_clear_all()
         cron_job* job = cron_job_list_first()->job;
         cron_job_list_remove(job->id);
         job->cancelled = true;
-        cron_job_unref(job);
     }
 
     // 运行中清空：立即重设定时器（空链表会停止它）
