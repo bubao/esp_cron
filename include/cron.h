@@ -60,7 +60,7 @@ struct cron_job_struct
   int refs;         // 引用计数：创建=1，入队+1，消费后-1，归零由持有者释放
   bool loaded;      // 表达式是否已成功解析
   bool cancelled;   // 标记取消：destroy 后已入队 job 不执行 callback
-  bool running;     // 正在执行回调（防重入：再到期时跳过本次触发）
+  bool in_flight;   // 从「成功入队」到「callback 执行结束」期间为 true，防同一 job 重复入队
   time_t next_execution;
   time_t last_triggered_sec; // 防抖：记录上次触发的秒
 };

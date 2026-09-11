@@ -397,9 +397,9 @@ void cb(cron_job *job) {
 
 runner 持有最后一个引用；job 在回调返回、runner 释放引用后才被 free。
 
-### 同一 job 不重叠执行
+### 同一 job 不重叠执行（in_flight 防重入）
 
-如果回调还在运行时下一个调度时刻已到，该次触发会被**跳过**（不会入队）。这防止同一 job 产生并发 runner —— 对 `pump ON → delay → pump OFF` 这类序列至关重要。
+job 一旦**成功入队**（runner 可能尚未启动），`in_flight` 即置位。如果下一个调度时刻到达时该 job 仍在执行或仍在队列中，本次触发会被**跳过**（不会入队）。这防止同一 job 产生并发 runner —— 对 `pump ON → delay → pump OFF` 这类序列至关重要。入队失败（如队列满）会恢复 `in_flight`，job 不会永远被跳过。
 
 ### start/stop 幂等
 
@@ -411,14 +411,16 @@ runner 持有最后一个引用；job 在回调返回、runner 释放引用后�
 
 `cron_stop()` 执行：
 - 停止定时器（不再产生新的队列事件）
-- 删除 worker 任务
+- **协作式停机**：向 worker 发送停止哨兵，worker 退出并 ack 后才继续，不在停机窗口内强制 `vTaskDelete` worker
 - 排空队列并 `cron_job_clear_all()`（所有任务被移除并释放）
+
+与 callback 的关系：`cron_stop()` **不等待正在执行的 callback**。已入队/service 的 job 会继续在 runner 上执行完，由引用计数安全收尾；未消费的队列引用被协议化排空，不泄漏。
 
 > `MAX_DUE_JOBS` 是**单次 timer 回调处理数量**，`QUEUE_DEPTH` 是**待执行队列容量** —— 两者都不是系统支持的最大 cron job 数量。所以 `16` 不代表"最多 16 个任务"。若同一时刻到期任务超过 `QUEUE_DEPTH`，超出的会被丢弃（打印 queue full 警告），但对应 job 会重新排到下一个匹配时刻。
 
 ### 队列满时的行为
 
-如果任务触发时 FreeRTOS 队列已满（超过 `CONFIG_ESP_CRON_QUEUE_DEPTH`），事件被丢弃、打印警告、并释放队列引用。**任务永远不会静默泄漏**。
+如果任务触发时 FreeRTOS 队列已满（超过 `CONFIG_ESP_CRON_QUEUE_DEPTH`），事件被丢弃、打印警告、恢复该 job 的 `in_flight` 标志并释放队列引用——因此该 job **不会**永久跳过，下次匹配时刻仍会正常触发。**任务永远不会静默泄漏**。
 
 ### 错过执行
 
@@ -449,7 +451,7 @@ runner 持有最后一个引用；job 在回调返回、runner 释放引用后�
 
 **不要用 esp_cron 做：**
 
-5. **长时间阻塞的 callback。** callback 在 runner task 上执行。如果 callback 阻塞数分钟（HTTP、大量计算、`vTaskDelay`），该 job 的下一次触发会被跳过（running 保护）。callback 应保持简短——发事件给专用业务 worker。
+5. **长时间阻塞的 callback。** callback 在 runner task 上执行。如果 callback 阻塞数分钟（HTTP、大量计算、`vTaskDelay`），该 job 的下一次触发会被跳过（`in_flight` 防重入保护：从入队到回调结束期间不会再次入队）。callback 应保持简短——发事件给专用业务 worker。
 
 6. **在 callback 内调用 `cron_stop()` / `cron_start()`。** 这会操作 worker 和定时器生命周期，可能导致死锁或在执行中途拆毁基础设施。（其他所有调度 API——schedule、unschedule、destroy、load_expression、reschedule_all——在 callback 内均可安全调用。）
 

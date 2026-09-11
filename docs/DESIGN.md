@@ -69,7 +69,7 @@ esp_timer_start_once(delay_us)  → 等到那个时刻
 | 锁 | 保护对象 | 必须获取时机 |
 |----|---------|-------------|
 | `s_mutex` | 链表操作、队列操作、状态机 | 所有链表读写 |
-| `s_ref_mutex` | `job->refs` 引用计数 | 仅 `cron_job_ref_locked()` 内（已在 `s_mutex` 内） |
+| `s_ref_mutex` | `job->refs` 引用计数、`in_flight`、`cancelled` | `cron_job_ref_locked()`、timer_cb 的 `in_flight` 读写、疑似 UAF 检查 |
 
 **锁顺序：** `s_mutex → s_ref_mutex`（永远如此，不可反向——否则 ABBA 死锁）
 
@@ -82,6 +82,19 @@ refs -= 1   destroy / clear_all（释放调用者持有）
 refs -= 1   runner task 回调结束（释放 queue 持有）
 refs == 0   free(job) —— 自动释放，不需要 join
 ```
+
+### 链表 insert 失败传播（P1-3）
+
+`cron_job_list_insert()` 在 `calloc` 失败时返回 `-1`。所有调用点必须检查并传播：
+
+| 调用点 | 失败行为 |
+|--------|---------|
+| `cron_job_create()`（经 schedule） | 释放 job 结构，返回 `NULL` —— 调用者不会拿到半初始化 job |
+| `cron_job_schedule()` | 返回 `-1`，打印日志，不再静默成功 |
+| `cron_job_schedule_nosched()`（timer_cb 重排） | 返回 `-1` + 日志（内存耗尽无法补救，但明确说了这是丢排期而非静默） |
+| `cron_job_reschedule_all()` | 返回 `-1` + 失败计数日志 |
+
+测试钩子：`cron_job_test_force_insert_fail()`（weak 默认 0，测试二进制强覆盖）注入 `calloc` 失败路径。
 
 链表本身**不持有引用**——job 在链表内的安全性由"调用者句柄引用 + s_mutex 串行化"共同保证。
 
@@ -136,17 +149,34 @@ cron_stop()                   ❌（会删除 worker，死锁）
 cron_start()                  ❌（同上）
 ```
 
-### 同一 job 不重叠执行
+### 同一 job 不重叠执行（in_flight 防重入）
 
-如果 callback 还在运行时下一个时刻到期，**该次触发被跳过**（不入队）。对 `pump ON → delay → pump OFF` 这类序列至关重要。
+job **成功入队**时 `in_flight` 即置位（先于 runner 启动）。如果下一次触发时刻到期时该 job 仍在执行或仍在队列中，**该次触发被跳过**（不入队）。对 `pump ON → delay → pump OFF` 这类序列至关重要。
 
 ### queue 满时的行为
 
 ```
-queue 满 → 打印警告 → unref（不泄漏） → stats.queue_full++
+queue 满 → 打印警告 → 恢复 in_flight → unref（不泄漏） → stats.queue_full++
 ```
 
-对应的 job 被跳过但**不会消失**：下次 timer_cb 时它仍在链表上，会被重新排到下一个匹配时刻。
+必须恢复 `in_flight`：否则该 job 再到期时会被当成"仍在执行"永远跳过（dead）。恢复后 job 下次匹配时刻仍会正常触发。
+
+### cron_stop 协作式停机（P0-2）
+
+```
+cron_stop()
+  ├── state = STOPPING
+  ├── 停止 + 删除 esp_timer（全程持 s_mutex，等价 esp_timer_stop_blocking 的 callback 同步）
+  ├── 队列发送 NULL 毒丸 → worker 收到即退出循环
+  ├── 等待 worker ack（s_worker_done，最多 1s；超时才防御性 vTaskDelete）
+  ├── 排空队列（unref 残留引用）
+  ├── state = STOPPED
+  └── cron_job_clear_all()
+```
+
+- 不直接在停机窗口 `vTaskDelete(cron.handle)`——避免 worker 半途退出破坏 refcount 追责链
+- `cron_stop()` 不等待正在执行的 callback：runner 由 refcount 安全收尾
+- 重复 feed 毒丸需要 queue 有空位，而 worker 只做 receive + xTaskCreate（不取任何锁），空位必然腾出，无死锁
 
 ---
 
@@ -195,7 +225,7 @@ tzset();
 |------|-------------|
 | Deep Sleep 唤醒后恢复定时 | esp_cron 是内存状态，Deep Sleep 丢失 RAM。应将 schedule 持久化到 NVS，唤醒后重建 job |
 | 需要 sub-second 精度 | 最小粒度 1 秒（`ccronexpr` 限制） |
-| 长时间阻塞的 callback | callback 在 runner task 上执行，长时间阻塞会导致该 job 跳过下一次触发（running 保护）。业务逻辑应发事件到专用 worker |
+| 长时间阻塞的 callback | callback 在 runner task 上执行，长时间阻塞会导致该 job 跳过下一次触发（in_flight 防重入）。业务逻辑应发事件到专用 worker |
 | 一个系统多个独立调度器 | 只支持单实例（一个 `cron_start` / `cron_stop`） |
 | 需要"追赶"错过的执行 | 设计上不回溯执行错过的时刻（防止重复灌溉等危险场景） |
 

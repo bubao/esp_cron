@@ -45,6 +45,14 @@ struct cron_job_node * cron_job_list_first();
 int cron_job_list_insert(cron_job * job);
 
 /*
+*  SUMMARY: Fault-injection hook for tests (weak, default returns 0).
+*  Override in a test binary to force cron_job_list_insert() to fail.
+*
+*  RETURNS: non-zero forces insert failure
+*/
+int32_t cron_job_test_force_insert_fail(void);
+
+/*
 *  SUMMARY: Removes a node from the list by job id.
 *
 *  RETURNS: 0 on success, -1 on not found

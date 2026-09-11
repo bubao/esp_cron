@@ -111,7 +111,8 @@ static cron_state_t cron = {
 //     （destroy 自己 / stop / clear_all），runner 最后执行 unref
 
 static SemaphoreHandle_t s_mutex = NULL;     // 保护链表、队列、状态
-static SemaphoreHandle_t s_ref_mutex = NULL;  // 保护 job->refs / running / cancelled
+static SemaphoreHandle_t s_ref_mutex = NULL;  // 保护 job->refs / in_flight / cancelled
+static SemaphoreHandle_t s_worker_done = NULL; // worker 退出通知（cron_stop 等待用）
 
 static void cron_ensure_mutex(void)
 {
@@ -119,6 +120,8 @@ static void cron_ensure_mutex(void)
         s_mutex = xSemaphoreCreateMutex();
     if (s_ref_mutex == NULL)
         s_ref_mutex = xSemaphoreCreateMutex();
+    if (s_worker_done == NULL)
+        s_worker_done = xSemaphoreCreateBinary();
 }
 
 // ====================== 引用计数 ========================
@@ -171,7 +174,10 @@ static int cron_job_schedule_nosched(cron_job* job)
     job->last_triggered_sec = -1;
     if (cron_job_exists_in_list(job->id))
         cron_job_list_remove(job->id);
-    cron_job_list_insert(job);
+    if (cron_job_list_insert(job) < 0) {
+        printf("esp_cron: failed to insert job %d into schedule\n", job->id);
+        return -1;
+    }
     return 0;
 }
 
@@ -195,12 +201,12 @@ static void timer_cb(void* arg)
             break;
         cron_job* job = node->job;
 
-        // 防重入：同一 job 正在执行回调则跳过本次触发
+        // 防重入：同一 job 已入队或正在执行则跳过本次触发。
         // （灌溉场景：pump ON/OFF 序列不能被并发 runner 打乱）
         xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
-        bool is_running = job->running;
+        bool in_flight = job->in_flight;
         xSemaphoreGive(s_ref_mutex);
-        if (is_running) {
+        if (in_flight) {
 #ifdef CONFIG_ESP_CRON_ENABLE_STATS
             stats.skipped_running++; // 不计入 cancelled（语义不同）
 #endif
@@ -221,16 +227,24 @@ static void timer_cb(void* arg)
         job->last_triggered_sec = now_sec;
 
         // --- P0-1 修复：ref 必须在 s_mutex 保护内完成 ---
-        // 先 ref，再入队，再从链表移除。顺序不可颠倒。
+        // 先置 in_flight（入队即视为执行中，杜绝入队后、runner 启动前的
+        // 重复入队窗口），再 ref，再入队，再从链表移除。顺序不可颠倒。
+        xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+        job->in_flight = true;
+        xSemaphoreGive(s_ref_mutex);
+
         cron_job_ref_locked(job);
         if (cron.task_queue && xQueueSend(cron.task_queue, &job, 0) == pdTRUE) {
-            // 入队成功：队列持有引用，回调执行完由 worker unref
+            // 入队成功：队列持有引用，in_flight 保持 true，回调执行完由 runner 清除
         } else {
-            // --- P0-3 修复：Queue 满时 unref + 日志，不静默丢弃 ---
+            // --- P0-3 修复：Queue 满时恢复 in_flight、unref + 日志，不静默丢弃 ---
             printf("esp_cron: queue full, job %d dropped\n", job->id);
 #ifdef CONFIG_ESP_CRON_ENABLE_STATS
             stats.queue_full++;
 #endif
+            xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+            job->in_flight = false; // 入队失败：必须恢复，否则 job 永远无法再次触发
+            xSemaphoreGive(s_ref_mutex);
             cron_job_unref(job); // 入队失败，释放 ref
         }
         cron_job_list_remove(job->id);
@@ -238,8 +252,10 @@ static void timer_cb(void* arg)
             due_jobs[due_count++] = job;
     }
 
-    for (int i = 0; i < due_count; ++i)
-        cron_job_schedule_nosched(due_jobs[i]);
+    for (int i = 0; i < due_count; ++i) {
+        if (cron_job_schedule_nosched(due_jobs[i]) != 0)
+            printf("esp_cron: failed to reschedule job %d after firing\n", due_jobs[i]->id);
+    }
 
     schedule_next_timer_locked();
     xSemaphoreGive(s_mutex);
@@ -323,19 +339,12 @@ static void job_runner_task(void* arg)
 {
     cron_job* job = (cron_job*)arg;
 
-    // runner 是 job 生命周期终结者：先置 running（防重入），
-    // 执行 callback，最后清除 running 并 unref。无论 callback
-    // 内发生什么（destroy 自己 / stop / clear_all），此处都执行。
+    // runner 执行 callback。in_flight 已在入队时置位（防重入起点是
+    // "成功入队"，不是"开始执行"），这里只负责执行完清除。
+    // 无论 callback 内发生什么（destroy 自己 / stop / clear_all），
+    // 最后都清除 in_flight 并 unref——runner 是生命周期终结者。
     if (job && !job->cancelled && job->callback) {
-        xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
-        job->running = true;
-        xSemaphoreGive(s_ref_mutex);
-
         job->callback(job);
-
-        xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
-        job->running = false;
-        xSemaphoreGive(s_ref_mutex);
 #ifdef CONFIG_ESP_CRON_ENABLE_STATS
         stats.executed++;
 #endif
@@ -344,6 +353,10 @@ static void job_runner_task(void* arg)
         stats.cancelled++;
 #endif
     }
+
+    xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+    job->in_flight = false;
+    xSemaphoreGive(s_ref_mutex);
 
     cron_job_unref(job);
     vTaskDelete(NULL);
@@ -356,21 +369,27 @@ static void cron_worker_task(void* arg)
     cron_job* job = NULL;
     while (1) {
         if (xQueueReceive(queue, &job, portMAX_DELAY)) {
-            if (job) {
-                // runner 创建失败时必须释放队列持有的引用，
-                // 否则该 job 的 refs 永远不会归零 → 内存泄漏
-                if (xTaskCreate(job_runner_task, "job_runner",
-                                CONFIG_ESP_CRON_WORKER_STACK_SIZE,
-                                job, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
-                    printf("esp_cron: failed to create runner task, job %d dropped\n", job->id);
+            if (job == NULL)
+                break; // P0-2: NULL 即 cron_stop 发来的停止哨兵（不作为 job 处理）
+            if (xTaskCreate(job_runner_task, "job_runner",
+                            CONFIG_ESP_CRON_WORKER_STACK_SIZE,
+                            job, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+                printf("esp_cron: failed to create runner task, job %d dropped\n", job->id);
 #ifdef CONFIG_ESP_CRON_ENABLE_STATS
-                    stats.runner_create_failed++;
+                stats.runner_create_failed++;
 #endif
-                    cron_job_unref(job);
-                }
+                // runner 没起来，入队时置的 in_flight 永远不会被清除，
+                // 必须恢复，否则该 job 再到期会一直被跳过（dead）。
+                xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+                if (job)
+                    job->in_flight = false;
+                xSemaphoreGive(s_ref_mutex);
+                cron_job_unref(job); // 释放队列持有的引用
             }
         }
     }
+    xSemaphoreGive(s_worker_done); // P0-2: 通知 cron_stop 本 worker 已退出
+    vTaskDelete(NULL);
 }
 
 // ====================== API 实现 ========================
@@ -467,11 +486,16 @@ static int cron_job_reschedule_all_locked(void)
         node = node->next;
     }
 
-    for (int i = 0; i < count; ++i)
-        cron_job_schedule_nosched(jobs[i]);
+    int failed = 0;
+    for (int i = 0; i < count; ++i) {
+        if (cron_job_schedule_nosched(jobs[i]) != 0)
+            failed++;
+    }
 
     free(jobs);
-    return 0;
+    if (failed > 0)
+        printf("esp_cron: reschedule_all failed for %d job(s)\n", failed);
+    return failed ? -1 : 0;
 }
 
 int cron_job_reschedule_all()
@@ -511,24 +535,48 @@ int cron_stop()
     // 由 refcount 保证其安全收尾。
     cron.state = CRON_STATE_STOPPING;
 
-    // 停止 worker 接收新的 job（先删任务，再删队列）
-    if (cron.handle) {
-        vTaskDelete(cron.handle);
-        cron.handle = NULL;
-    }
-
+    // --- P0-2 修复：cooperative worker 停机 ---
+    // 全程持有 s_mutex（timer_cb 需要 s_mutex，故此刻不可能有 timer_cb 在跑，
+    // 等价于 esp_timer_stop_blocking 的 callback 生命周期同步），无直接 vTaskDelete：
+    // 向队列发送 NULL 毒丸 → worker 收到后退出循环并自删 → cron_stop 等 ack。
+    // 先停 timer，杜绝停机窗口内新 job 入队。
     if (cron.esp_timer) {
         esp_timer_stop(cron.esp_timer);
         esp_timer_delete(cron.esp_timer);
         cron.esp_timer = NULL;
     }
 
-    // 排空队列中未消费的引用
+    if (cron.handle && cron.task_queue) {
+        cron_job* poison = NULL;
+        // worker 只做 receive + xTaskCreate，不取任何锁，空位必然腾出，
+        // 不会与 s_mutex 死锁；portMAX_DELAY 安全。
+        if (xQueueSend(cron.task_queue, &poison, portMAX_DELAY) == pdTRUE) {
+            if (xSemaphoreTake(s_worker_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                // 防御兜底：worker 未按时 ack（异常）。此刻它必然阻塞在
+                // xQueueReceive 或 xTaskCreate 中途，直接删除不会泄漏队列引用。
+                printf("esp_cron: worker did not ack stop, force deleting\n");
+                vTaskDelete(cron.handle);
+            }
+        } else {
+            // xQueueSend portMAX_DELAY 不会失败，此分支仅做防御
+            printf("esp_cron: failed to signal worker stop\n");
+            vTaskDelete(cron.handle);
+        }
+        cron.handle = NULL;
+    }
+
+    // 排空队列中未消费的引用（worker 已退出，无人在消费）
+    // 清 in_flight：这些 job 从未被 runner 消费过，若调用者仍持有引用，
+    // in_flight 必须复位，否则重新 schedule 后会被永久跳过（dead）。
     if (cron.task_queue) {
         cron_job* pending = NULL;
         while (xQueueReceive(cron.task_queue, &pending, 0) == pdTRUE) {
-            if (pending)
+            if (pending) {
+                xSemaphoreTake(s_ref_mutex, portMAX_DELAY);
+                pending->in_flight = false;
+                xSemaphoreGive(s_ref_mutex);
                 cron_job_unref(pending);
+            }
         }
         vQueueDelete(cron.task_queue);
         cron.task_queue = NULL;
@@ -565,6 +613,10 @@ int cron_start()
         xSemaphoreGive(s_mutex);
         return -1;
     }
+
+    // P0-2: 清掉上次 stop 可能残留的 worker ack token（如上次超时强删），
+    // 否则本次 stop 会误取旧 ack 直接跳过等待。
+    xSemaphoreTake(s_worker_done, 0);
 
     if (xTaskCreate(cron_worker_task, "cron_worker", CONFIG_ESP_CRON_WORKER_STACK_SIZE,
                     cron.task_queue, tskIDLE_PRIORITY + 2, &cron.handle) != pdPASS) {
@@ -614,7 +666,11 @@ int cron_job_schedule(cron_job* job)
     job->last_triggered_sec = -1;
     if (cron_job_exists_in_list(job->id))
         cron_job_list_remove(job->id);
-    cron_job_list_insert(job);
+    if (cron_job_list_insert(job) < 0) {
+        printf("esp_cron: failed to insert job %d into schedule\n", job->id);
+        xSemaphoreGive(s_mutex);
+        return -1;
+    }
 
     struct cron_job_node* node = cron_job_list_first();
     if (node && node->job == job)

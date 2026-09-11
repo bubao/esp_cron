@@ -397,9 +397,9 @@ void cb(cron_job *job) {
 
 The runner owns the final reference; the job is freed only after the callback returns and the runner releases it.
 
-### No overlap of the same job
+### No overlap of the same job (in_flight guard)
 
-If a callback is still running when its next scheduled moment arrives, that trigger is **skipped** (never queued). This prevents concurrent runners for the same job — critical for sequences like `pump ON → delay → pump OFF`.
+Once a job is **successfully queued** (its runner may not have started yet), its `in_flight` flag is set. If the next scheduled moment arrives while that job is still executing or still in the queue, that trigger is **skipped** (never queued). This prevents concurrent runners for the same job — critical for sequences like `pump ON → delay → pump OFF`. If enqueue fails (queue full), `in_flight` is restored so the job is never permanently skipped.
 
 ### start/stop are idempotent
 
@@ -411,15 +411,17 @@ If a callback is still running when its next scheduled moment arrives, that trig
 
 `cron_stop()`:
 - Stops the timer (no new queue events)
-- Deletes the worker task
-- Drains `cron_job_clear_all()` (all jobs removed and freed)
+- **Cooperative shutdown**: sends a stop sentinel to the worker, waits for its ack, then proceeds — the worker is never force-deleted mid-operation
+- Drains the queue and `cron_job_clear_all()` (all jobs removed and freed)
+
+Note: `cron_stop()` does **not** wait for callbacks already in-flight. Queued/running jobs finish on their runners (refcount guarantees safe teardown); un-consumed queue references are drained and released without leaking.
 
 > `MAX_DUE_JOBS` is the **number processed per timer callback**, `QUEUE_DEPTH` is the **pending-execution queue capacity** — neither is a limit on how many cron jobs you may create. So `16` does not mean "max 16 jobs". If more jobs are due in one moment than `QUEUE_DEPTH`, the excess is dropped (`queue full` warning) but the offending jobs are rescheduled for their next matching moment.
 
 ### Queue full behavior
 
 If the FreeRTOS queue is full when a job fires
-(`CONFIG_ESP_CRON_QUEUE_DEPTH` exceeded), the event is dropped, a warning is printed, and the queue reference is released. **Jobs are never silently leaked**.
+(`CONFIG_ESP_CRON_QUEUE_DEPTH` exceeded), the event is dropped, a warning is printed, the job's `in_flight` flag is **restored** (so it fires again on the next matching moment), and the queue reference is released. **Jobs are never silently leaked and never permanently stuck skipped**.
 
 ### Missed executions
 
@@ -450,7 +452,7 @@ Callbacks run on a per-job runner task. Keep them short — send an event to a b
 
 **Do NOT use esp_cron for:**
 
-5. **Long-running callbacks.** Callbacks run on a per-job runner task. If your callback blocks for minutes (HTTP, heavy computation, `vTaskDelay`), the job's next trigger will be skipped (running protection). Keep callbacks short — send an event to a dedicated worker task instead.
+5. **Long-running callbacks.** Callbacks run on a per-job runner task. If your callback blocks for minutes (HTTP, heavy computation, `vTaskDelay`), the job's next trigger will be skipped (`in_flight` guard — no concurrent runners for the same job). Keep callbacks short — send an event to a dedicated worker task instead.
 
 6. **Calling `cron_stop()` / `cron_start()` from inside a callback.** This manipulates the scheduler's worker and timer lifecycle; calling them from a runner can deadlock or tear down infrastructure mid-execution. (All other scheduler APIs — schedule, unschedule, destroy, load_expression, reschedule_all — are safe inside callbacks.)
 

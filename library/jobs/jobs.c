@@ -21,6 +21,14 @@
 #include "freertos/semphr.h"
 #include <stdlib.h>
 
+// --- 故障注入测试钩子（P1-3）---
+// 弱符号，默认不注入。测试二进制可通过强覆盖该符号返回非 0，
+// 强制让 cron_job_list_insert() 走失败路径，验证 insert 错误被传播。
+__attribute__((weak)) int32_t cron_job_test_force_insert_fail(void)
+{
+    return 0;
+}
+
 // STATIC STRUCTS
 static struct
 {
@@ -69,6 +77,8 @@ int cron_job_list_insert(cron_job* job)
     if (linked_list_state.semaphore == NULL)
         cron_job_list_init();
     if (job == NULL)
+        return -1;
+    if (cron_job_test_force_insert_fail())
         return -1;
 
     struct cron_job_node* new_node = calloc(1, sizeof(struct cron_job_node));
